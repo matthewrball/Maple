@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Exercise RPM staging identity and packaging failures without native builds."""
 
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -78,8 +80,9 @@ fi
 
     def fake_rpmbuild(self, exit_code):
         tool = self.bin / "rpmbuild"
-        tool.write_text(f'''#!/usr/bin/env bash
+        tool.write_text(f'''#!{shutil.which("bash")}
 set -eu
+cp "$2" "$FIXTURE_TAURI/maple.spec"
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --define ]; then
     case "$2" in "_topdir "*) topdir="${{2#_topdir }}" ;; esac
@@ -109,6 +112,47 @@ fi
         result = self.run_factory()
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.rpm.exists())
+
+    def test_rpm_preserves_configured_runtime_dependencies(self):
+        config = json.loads((ROOT / "apps/maple-research/frontend/src-tauri/tauri.conf.json").read_text())
+        self.assertIn("webkit2gtk4.1", config["bundle"]["linux"]["rpm"]["depends"])
+        (self.tauri / "tauri.conf.json").write_text(json.dumps(config))
+        self.fake_rpmbuild(0)
+        result = self.run_factory()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        spec = (self.tauri / "maple.spec").read_text()
+        self.assertIn("Requires: webkit2gtk4.1\n", spec)
+
+    def test_rpm_dependency_verification(self):
+        for requires, expected in (("webkit2gtk4.1", 0), ("rpmlib(PayloadFilesHavePrefix) <= 4.0-1", 1), ("webkit2gtk4.0", 1)):
+            with self.subTest(requires=requires):
+                result = self.run_shell(f'''
+rpm() {{ printf '%s\\n' '{requires}'; }}
+verify_linux_rpm_package_dependencies fixture.rpm
+''')
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    @unittest.skipUnless(shutil.which("rpmbuild") and shutil.which("rpm"), "RPM tools are unavailable")
+    def test_built_rpm_declares_webkit_dependency(self):
+        config = json.loads((ROOT / "apps/maple-research/frontend/src-tauri/tauri.conf.json").read_text())
+        config["version"] = "1.2.3"
+        (self.tauri / "tauri.conf.json").write_text(json.dumps(config))
+        result = self.run_factory()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        requires = subprocess.run(
+            ["rpm", "-qp", "--requires", str(self.rpm)],
+            capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        self.assertIn("webkit2gtk4.1", requires)
+        verified = self.run_shell(f'verify_linux_rpm_package_dependencies "{self.rpm}"')
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_rpm_query_failure_is_rejected(self):
+        result = self.run_shell('''
+rpm() { return 19; }
+verify_linux_rpm_package_dependencies fixture.rpm
+''')
+        self.assertNotEqual(result.returncode, 0)
 
     def test_failed_final_move_is_not_hidden_by_cleanup(self):
         self.fake_rpmbuild(0)

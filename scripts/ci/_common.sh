@@ -3826,10 +3826,22 @@ verify_linux_appimage_executable_metadata() {
   return "${status}"
 }
 
+verify_linux_rpm_package_dependencies() {
+  local package="$1"
+  local requires
+
+  requires="$(rpm -qp --requires "${package}")" || return 1
+  if ! grep -Fxq 'webkit2gtk4.1' <<< "${requires}"; then
+    echo "RPM is missing the required webkit2gtk4.1 dependency: ${package}" >&2
+    return 1
+  fi
+}
+
 verify_linux_rpm_package_executable_metadata() {
   local rpm="$1"
   local tmp status
 
+  verify_linux_rpm_package_dependencies "${rpm}" || return 1
   tmp="$(mktemp -d)"
   status=0
   (
@@ -3923,7 +3935,7 @@ build_rpm_package_from_payload() {
   local rpm="$1"
   local payload="$2"
   local topdir spec built_rpm
-  local version release arch rpm_build_shell
+  local version release arch rpm_build_shell requires
 
   command -v rpmbuild >/dev/null 2>&1 || {
     echo "rpmbuild is required to build RPM packages. Run through the flake CI shell." >&2
@@ -3933,6 +3945,9 @@ build_rpm_package_from_payload() {
 
   version="$(jq -r '.version' "${TAURI_DIR}/tauri.conf.json")"
   release="$(jq -r '.bundle.linux.rpm.release // "1"' "${TAURI_DIR}/tauri.conf.json")"
+  # The normalized RPM bypasses Tauri's bundler and automatic RPM requirements.
+  # Preserve the explicit runtime dependencies from the shared bundle config.
+  requires="$(jq -r '.bundle.linux.rpm.depends // [] | map("Requires: " + .) | join("\n")' "${TAURI_DIR}/tauri.conf.json")"
   arch="$(rpm_arch)"
   topdir="$(mktemp -d)"
   spec="${topdir}/SPECS/maple.spec"
@@ -3949,6 +3964,7 @@ Summary: Maple AI
 License: MIT
 BuildArch: ${arch}
 AutoReqProv: no
+${requires}
 
 %description
 Maple AI
