@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Maple Agent Debug</string>
+    <key>CFBundleExecutable</key>
+    <string>maple-agent</string>
+    <key>CFBundleIdentifier</key>
+    <string>cloud.opensecret.maple.agent.debug</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Maple Work Debug</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Maple uses Automation only when a computer-use action needs to communicate with another app.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Maple records your microphone when you choose to dictate a message.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Maple keeps its default workspace in Documents/Maple, where the agent works on the files for your tasks.</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Maple captures the screen when you explicitly enable computer use so the agent can see and interact with apps you ask it to control.</string>
+</dict>
+</plist>

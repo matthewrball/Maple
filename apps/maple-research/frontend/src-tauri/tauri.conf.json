@@ -1,0 +1,116 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Maple",
+  "version": "3.4.6",
+  "identifier": "cloud.opensecret.maple",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "bun dev",
+    "beforeBuildCommand": "bun run build"
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://updates.trymaple.ai/latest.json",
+        "https://github.com/OpenSecretCloud/Maple/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRCRjU0OEJCM0M2OTNEQjAKUldTd1BXazh1MGoxUyt3TXdHREU1WUdzL1VNYlludXhORHpQSUc1cGxSSW1kdEYrOXNPNzRjdUUK"
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["cloud.opensecret.maple"]
+      },
+      "mobile": [
+        {
+          "scheme": ["https"],
+          "host": "trymaple.ai",
+          "pathPrefix": ["/payment-success"],
+          "appLink": true
+        },
+        {
+          "scheme": ["https"],
+          "host": "trymaple.ai",
+          "pathPrefix": ["/payment-canceled"],
+          "appLink": true
+        },
+        {
+          "scheme": ["https"],
+          "host": "trymaple.ai",
+          "pathPrefix": ["/pricing"],
+          "appLink": true
+        }
+      ]
+    }
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Maple - Private AI Chat",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' https://opensecret.cloud https://*.opensecret.cloud https://trymaple.ai https://*.trymaple.ai https://secretgpt.ai https://*.secretgpt.ai https://*.maple-ca8.pages.dev https://raw.githubusercontent.com localhost:* http://localhost:* http://0.0.0.0:* http://127.0.0.1:*; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; media-src 'self' blob: mediastream:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "deb", "appimage", "rpm", "dmg", "app"],
+    "publisher": "OpenSecret",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true,
+        "files": {
+          "/usr/lib/maple/libonnxruntime.so": "./onnxruntime-linux/onnxruntime-linux-x64-1.23.2/lib/libonnxruntime.so.1.23.2"
+        }
+      },
+      "deb": {
+        "files": {
+          "/usr/lib/maple/libonnxruntime.so": "./onnxruntime-linux/onnxruntime-linux-x64-1.23.2/lib/libonnxruntime.so.1.23.2"
+        }
+      }
+    },
+    "macOS": {
+      "frameworks": [
+        "./onnxruntime-macos/onnxruntime-osx-universal2-1.23.2/lib/libonnxruntime.1.23.2.dylib"
+      ],
+      "minimumSystemVersion": "13.4",
+      "exceptionDomain": "opensecret.cloud",
+      "signingIdentity": null,
+      "entitlements": "./Entitlements.plist"
+    },
+    "iOS": {
+      "developmentTeam": "X773Y823TN",
+      "minimumSystemVersion": "16.0"
+    },
+    "android": {
+      "versionCode": 2000028029
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "",
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "createUpdaterArtifacts": true
+  }
+}

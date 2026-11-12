@@ -1,0 +1,91 @@
+name: Auth Pages CI
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  pull_request:
+    # Include stacked PRs and forks; this job has no publishing authority. The
+    # Pages and publisher tests run in ci.yml's repo lane.
+    paths:
+      - ".github/workflows/auth-pages-ci.yml"
+      - "apps/maple-auth/**"
+      - "scripts/ci/auth-*.sh"
+      - "scripts/ci/pages_artifact.py"
+      - "scripts/ci/pages_auth_build.py"
+      - "flake.nix"
+      - "flake.lock"
+  push:
+    branches: [master]
+    # Publisher edits also run, so master's Dev deployment rehearses them before Prod.
+    paths:
+      - ".github/workflows/auth-pages-*.yml"
+      - "apps/maple-auth/**"
+      - "scripts/ci/auth-*.sh"
+      - "scripts/ci/pages_*.py"
+      - "flake.nix"
+      - "flake.lock"
+
+concurrency:
+  # A newer PR head replaces an older build; master builds never cancel.
+  group: auth-pages-ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  auth:
+    if: >-
+      github.event_name == 'pull_request' ||
+      ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+        github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout auth source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Test the standalone auth app
+        run: nix develop --no-update-lock-file .#ci -c bash scripts/ci/auth-ci.sh
+
+      - name: Build auth with development services
+        env:
+          MAPLE_AUTH_ENVIRONMENT: dev
+        run: nix develop --no-update-lock-file .#ci -c bash scripts/ci/auth-web.sh
+
+      - name: Describe the auth artifact
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          set -euo pipefail
+          artifact_dir="apps/maple-auth/target/reproducibility"
+          nix develop --no-update-lock-file .#pages -c python3 -I scripts/ci/pages_artifact.py manifest \
+            --archive "$artifact_dir/maple-auth-dist.tar.gz" \
+            --profile auth-dev \
+            --sha "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$artifact_dir/pages-artifact.json"
+
+      - name: Upload the auth artifact
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: maple-auth-development-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            apps/maple-auth/target/reproducibility/maple-auth-dist.tar.gz
+            apps/maple-auth/target/reproducibility/pages-artifact.json
+          if-no-files-found: error
+          retention-days: 5

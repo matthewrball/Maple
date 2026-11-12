@@ -1,0 +1,322 @@
+{
+  description = "Native Maple desktop app built with GPUI";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs =
+    {
+      nixpkgs,
+      rust-overlay,
+      ...
+    }:
+    let
+      supportedSystems = [
+        "aarch64-darwin"
+        "aarch64-linux"
+        "x86_64-linux"
+      ];
+      # The pinned Swift compiler cannot compile the macOS CUA bridges with
+      # the SDK required for recording. macOS builds use the Xcode dev shell.
+      packageSystems = [
+        "aarch64-linux"
+        "x86_64-linux"
+      ];
+      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+      forPackageSystems = nixpkgs.lib.genAttrs packageSystems;
+    in
+    {
+      packages = forPackageSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+          };
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [
+              "clippy"
+              "rustfmt"
+            ];
+          };
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
+          linuxRuntimeInputs = with pkgs; [
+            libxcb
+            libxkbcommon
+            libglvnd
+            mesa
+            vulkan-loader
+            wayland
+            # Embedded CUA drives X11 windows and synthetic input through the
+            # Cua Driver SDK's Linux backend. Wayland sessions reach the
+            # desktop through the portal and libei, which are pure Rust.
+            xorg.libX11
+            xorg.libXi
+            xorg.libXtst
+          ];
+          linuxBuildInputs = with pkgs; [
+            alsa-lib
+            fontconfig
+            freetype
+          ] ++ linuxRuntimeInputs;
+        in
+        {
+          default = rustPlatform.buildRustPackage {
+            pname = "maple-agent";
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
+            src = pkgs.lib.fileset.toSource {
+              root = ../..;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.lock
+                ./Cargo.toml
+                ./release-profiles.json
+                ./release_profile.rs
+                ./app
+                ./crates
+                ./scripts
+                ./dependencies/sqlcipher
+                ../../sdk/rust/Cargo.toml
+                ../../sdk/rust/src
+                ../../sdk/rust/assets
+                ../../proxy/Cargo.toml
+                ../../proxy/src
+              ];
+            };
+
+            # Keep the source tree rooted at Maple so sibling path dependencies
+            # resolve identically in a pure package and a development checkout.
+            cargoRoot = "apps/maple-agent";
+            buildAndTestSubdir = "apps/maple-agent";
+
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes = {
+                "libsqlite3-sys-0.38.2" = "sha256-+Ppdrv03WsGQkCcWw6qiwnDnbY/z4ql2O/RSxEdXuyQ=";
+                "pake-cpace-0.1.0" = "07ig50fcmrlsccn0pmxk30bznbdqq9fgs01y9qw9881vv34a18gj";
+                "collections-0.1.0" = "sha256-d2GVmZgvJzLk1pbNtPedw0V09+ANZFORZjTSLVxw7jc=";
+                "proptest-1.10.0" = "sha256-p5NTcHhruI8QQvANACg8AMRVNmuvGxs2NLit+/8PaWo=";
+                "wasm_thread-0.3.3" = "sha256-+lRLCIk0S6Y5ORYjDKsYYHia2FtoSoh+rWkQh7mnPBE=";
+                "xim-ctext-0.3.0" = "sha256-pRT4Sz1JU9ros47/7pmIW9kosWOGMOItcnNd+VrvnpE=";
+                "zed-font-kit-0.14.1-zed" = "sha256-KXygi0olNQi5yM8eaJVykNDtbPMDjT+cWPBF8UrtXR4=";
+                "zed-scap-0.0.8-zed" = "sha256-BihiQHlal/eRsktyf0GI3aSWsUCW7WcICMsC2Xvb7kw=";
+                "cua-driver-sdk-0.38.0" = "sha256-nXvjGhAxEB5rTOC9oCbWiULttOijpszAjuuC/R3WfWI=";
+              };
+            };
+
+            nativeBuildInputs = with pkgs; [
+              clang
+              cmake
+              pkg-config
+              perl
+              python3
+            ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.makeWrapper ];
+
+            buildInputs =
+              [ pkgs.libiconv ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxBuildInputs;
+
+            cargoBuildFlags = [
+              "-p"
+              "maple-agent-app"
+            ];
+
+            # The upstream CI runs the complete workspace and feature matrix.
+            # Keep the package derivation focused on producing the release binary.
+            doCheck = false;
+
+            # GPUI loads the Wayland and Vulkan libraries at runtime, so they are
+            # not discovered by ELF dependency scanning. Prefer the NixOS GPU
+            # driver link and retain Mesa as a portable fallback elsewhere.
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              wrapProgram "$out/bin/maple-agent" \
+                --prefix LD_LIBRARY_PATH : "${pkgs.addDriverRunpath.driverLink}/lib:${pkgs.lib.makeLibraryPath linuxRuntimeInputs}" \
+                --suffix VK_ADD_DRIVER_FILES : "${pkgs.addDriverRunpath.driverLink}/share/vulkan/icd.d:${pkgs.mesa}/share/vulkan/icd.d"
+            '';
+
+            meta = {
+              description = "Native Maple desktop app built with GPUI";
+              homepage = "https://github.com/MaplePrivacyLabs/Maple/tree/master/apps/maple-agent";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "maple-agent";
+              platforms = packageSystems;
+            };
+          };
+        }
+      );
+
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+          };
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [
+              "clippy"
+              "rustfmt"
+            ];
+          };
+          linuxRuntimeInputs = with pkgs; [
+            libxcb
+            libxkbcommon
+            libglvnd
+            mesa
+            vulkan-loader
+            wayland
+            # Embedded CUA drives X11 windows and synthetic input through the
+            # Cua Driver SDK's Linux backend. Wayland sessions reach the
+            # desktop through the portal and libei, which are pure Rust.
+            xorg.libX11
+            xorg.libXi
+            xorg.libXtst
+          ];
+          linuxBuildInputs = with pkgs; [
+            alsa-lib
+            fontconfig
+            freetype
+          ] ++ linuxRuntimeInputs;
+          isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+          mkDevShell = if isDarwin then pkgs.mkShellNoCC else pkgs.mkShell;
+          xcrun = pkgs.writeShellScriptBin "xcrun" ''
+            exec /usr/bin/xcrun "$@"
+          '';
+          # Agent owns its distribution tools and runtime closure. These fixed
+          # hashes also pin the tools used by Research, without importing its
+          # Tauri packaging scripts or requiring its flake.
+          appimageTools =
+            if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isx86_64 then
+              let
+                linuxdeploy = pkgs.fetchurl {
+                  url = "https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy/linuxdeploy-x86_64.AppImage";
+                  hash = "sha256-52K+qFyOsNSzUI1G5cHwN/cX0PkwOuO0qvyLBJkfoe8=";
+                };
+                runtime = pkgs.fetchurl {
+                  url = "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64";
+                  hash = "sha256-L8qLRDySUQ8Ug6iD9gBhrQm0a5eLJjHIB82HOkfsJg0=";
+                };
+              in
+              pkgs.runCommand "maple-agent-appimage-tools-x86_64" { } ''
+                mkdir -p "$out"
+                install -m 0755 ${linuxdeploy} "$out/linuxdeploy-x86_64.AppImage"
+                install -m 0755 ${runtime} "$out/runtime-x86_64"
+              ''
+            else
+              null;
+          linuxRuntimeClosure =
+            if pkgs.stdenv.hostPlatform.isLinux then
+              pkgs.closureInfo {
+                rootPaths = linuxBuildInputs ++ [ pkgs.stdenv.cc.cc.lib pkgs.glibc ];
+              }
+            else
+              null;
+        in
+        {
+          default = mkDevShell {
+            packages = with pkgs; [
+              clang
+              cmake
+              pkg-config
+              rustToolchain
+              just
+              python3
+              perl
+              # Reproduce the pinned SQLCipher amalgamation and audit its graph.
+              git
+              gnupg
+              tcl
+              gnumake
+              cargo-deny
+            ]
+            ++ pkgs.lib.optionals isDarwin [ xcrun ]
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              pkgs.binutils
+              pkgs.patchelf
+              pkgs.squashfsTools
+            ];
+
+            buildInputs =
+              [ pkgs.libiconv ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxBuildInputs;
+
+            shellHook = ''
+              # Cargo can prefer rustup proxies in CARGO_HOME/bin over PATH
+              # for external subcommands. Keep fmt/clippy on this Nix compiler.
+              export RUSTUP_TOOLCHAIN="${rustToolchain}"
+              if [ -z "''${CI:-}" ] \
+                && [ "''${MAPLE_DISABLE_SHARED_CARGO_BUILD_DIR:-0}" != "1" ] \
+                && [ -z "''${CARGO_BUILD_BUILD_DIR:-}" ] \
+                && command -v rustc >/dev/null 2>&1; then
+                maple_agent_rust_host="$(rustc -vV | awk '/^host:/{print $2}')"
+                maple_agent_rust_version="$(rustc --version | awk '{print $2}')"
+                export CARGO_BUILD_BUILD_DIR="$HOME/.cache/cargo-build/maple-agent/''${maple_agent_rust_host}/rust-''${maple_agent_rust_version}"
+                unset maple_agent_rust_host maple_agent_rust_version
+              fi
+              if [ -n "''${CARGO_BUILD_BUILD_DIR:-}" ]; then
+                echo "Maple Agent Cargo build cache: $CARGO_BUILD_BUILD_DIR"
+              fi
+            '' + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              export LD_LIBRARY_PATH="${pkgs.addDriverRunpath.driverLink}/lib:${pkgs.lib.makeLibraryPath linuxRuntimeInputs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export VK_ADD_DRIVER_FILES="${pkgs.addDriverRunpath.driverLink}/share/vulkan/icd.d:${pkgs.mesa}/share/vulkan/icd.d''${VK_ADD_DRIVER_FILES:+:$VK_ADD_DRIVER_FILES}"
+              export MAPLE_AGENT_LINUX_CLOSURE_INFO="${linuxRuntimeClosure}"
+              export MAPLE_AGENT_LINUX_GLIBC="${pkgs.glibc}"
+            '' + pkgs.lib.optionalString (appimageTools != null) ''
+              export MAPLE_AGENT_APPIMAGE_TOOLS="${appimageTools}"
+            '' + pkgs.lib.optionalString isDarwin ''
+              maple_nix_valid_developer_dir() {
+                [ -d "$1" ] \
+                  && [ -x "$1/usr/bin/xcodebuild" ] \
+                  && DEVELOPER_DIR="$1" /usr/bin/xcrun --sdk macosx --show-sdk-path >/dev/null 2>&1
+              }
+
+              maple_nix_developer_dir=""
+              if [ -n "''${MAPLE_NIX_XCODE_VERSION:-}" ]; then
+                maple_nix_developer_dir="/Applications/Xcode_''${MAPLE_NIX_XCODE_VERSION}.app/Contents/Developer"
+                if ! maple_nix_valid_developer_dir "$maple_nix_developer_dir"; then
+                  echo "Maple Nix shell: Xcode ''${MAPLE_NIX_XCODE_VERSION} was not found at $maple_nix_developer_dir." >&2
+                  echo "Install that version, or unset MAPLE_NIX_XCODE_VERSION and set DEVELOPER_DIR to a full Xcode installation." >&2
+                  exit 1
+                fi
+              elif [ -n "''${DEVELOPER_DIR:-}" ] && maple_nix_valid_developer_dir "$DEVELOPER_DIR"; then
+                maple_nix_developer_dir="$DEVELOPER_DIR"
+              elif maple_nix_valid_developer_dir "/Applications/Xcode.app/Contents/Developer"; then
+                maple_nix_developer_dir="/Applications/Xcode.app/Contents/Developer"
+              else
+                maple_nix_selected_developer_dir="$(DEVELOPER_DIR= /usr/bin/xcode-select -p 2>/dev/null || true)"
+                if maple_nix_valid_developer_dir "$maple_nix_selected_developer_dir"; then
+                  maple_nix_developer_dir="$maple_nix_selected_developer_dir"
+                else
+                  echo "Maple Nix shell: no full Xcode installation was found." >&2
+                  echo "Install Xcode, select it with xcode-select, or set MAPLE_NIX_XCODE_VERSION/DEVELOPER_DIR." >&2
+                  exit 1
+                fi
+              fi
+
+              export DEVELOPER_DIR="$maple_nix_developer_dir"
+              export SDKROOT="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
+              # Native Rust dependencies such as aws-lc ask cc-rs to compile
+              # against the macOS SDK. Point cc-rs at Xcode's actual compiler
+              # so it recognizes the Apple toolchain and supplies -isysroot;
+              # nixpkgs' generic clang wrapper cannot infer that SDK boundary.
+              export CC="$(/usr/bin/xcrun --find clang)"
+              export CXX="$(/usr/bin/xcrun --find clang++)"
+              export PATH="${xcrun}/bin:$PATH"
+
+              unset maple_nix_developer_dir maple_nix_selected_developer_dir
+              unset -f maple_nix_valid_developer_dir
+            '';
+          };
+        }
+      );
+    };
+}

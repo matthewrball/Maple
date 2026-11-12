@@ -1,0 +1,149 @@
+#!/bin/sh
+# Maple monorepo pre-commit hook.
+#
+# `scripts/ci/plan.py hook --staged` selects components from the ci.yml lane
+# table (scripts/ci/lanes.py): a lane's own paths select its `hook` component.
+# Each selected component's .githooks/pre-commit runs inside that component's
+# Nix flake, so the tools match CI. Without Nix the same commands run from PATH
+# with a warning. Only fast, hermetic checks run here (format, lint, type
+# checks, unit tests); integration suites, cargo-deny, nix flake check and
+# packaging stay in CI.
+#
+# Environment:
+#   MAPLE_HOOK_SKIP=1     skip everything (same as git commit --no-verify)
+#   MAPLE_HOOK_FULL=1     run the slower CI-complete variants where they exist
+#   MAPLE_HOOK_NO_NIX=1   run from PATH even when Nix is installed
+#   MAPLE_HOOK_ONLY=a,b   restrict to the listed components (debugging aid)
+
+set -u
+
+REPO_ROOT=$(git rev-parse --show-toplevel) || exit 1
+. "$REPO_ROOT/.githooks/lib/common.sh"
+
+if [ "${MAPLE_HOOK_SKIP:-0}" = "1" ]; then
+    hook_log "MAPLE_HOOK_SKIP=1; skipping checks."
+    exit 0
+fi
+# Component checks may run git themselves (the scripts/ci tests build fixture
+# repositories). Never let a nested commit re-enter this hook.
+if [ "${MAPLE_HOOK_RUNNING:-0}" = "1" ]; then
+    exit 0
+fi
+export MAPLE_HOOK_RUNNING=1
+
+STAGED_FILE=$(mktemp "${TMPDIR:-/tmp}/maple-hook-staged.XXXXXX") || exit 1
+trap 'rm -f "$STAGED_FILE"' EXIT INT TERM
+git diff --cached --name-only --diff-filter=ACMR > "$STAGED_FILE"
+
+if [ ! -s "$STAGED_FILE" ]; then
+    hook_log "No added or modified files staged; nothing to check."
+    exit 0
+fi
+
+PYTHON=""
+for candidate in python3 /usr/bin/python3 /run/current-system/sw/bin/python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        PYTHON=$(command -v "$candidate")
+        break
+    fi
+done
+[ -n "$PYTHON" ] || hook_fail "python3 is required to classify staged paths (it is in every Maple Nix shell)."
+
+SELECTED=$("$PYTHON" "$REPO_ROOT/scripts/ci/plan.py" hook --staged) \
+    || hook_fail "scripts/ci/plan.py hook failed."
+SELECTED=$(printf '%s\n' "$SELECTED" | tr '\n' ' ')
+
+if [ -n "${MAPLE_HOOK_ONLY:-}" ]; then
+    SELECTED=$(printf '%s' "$MAPLE_HOOK_ONLY" | tr ',' ' ')
+fi
+
+if [ -z "$(printf '%s' "$SELECTED" | tr -d ' ')" ]; then
+    hook_log "Staged files select no component checks (docs, guides, or hook metadata only)."
+    exit 0
+fi
+hook_log "Selected components: $SELECTED"
+
+NIX_BIN=""
+if [ "${MAPLE_HOOK_NO_NIX:-0}" != "1" ]; then
+    NIX_BIN=$(hook_find_nix) || NIX_BIN=""
+fi
+if [ -z "$NIX_BIN" ]; then
+    hook_log "WARNING: Nix not found; running checks with tools from PATH. Results may differ from CI."
+fi
+
+GIT_ENV_UNSET="-u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE"
+export MAPLE_HOOK_REPO_ROOT="$REPO_ROOT"
+export MAPLE_HOOK_STAGED="$STAGED_FILE"
+export MAPLE_HOOK_SELECTED="$SELECTED"
+export MAPLE_HOOK_FULL="${MAPLE_HOOK_FULL:-0}"
+
+# run_component NAME DIR FLAKE_REF SCRIPT [--bash] [ENV=VALUE ...]
+#   DIR is where the script and `nix develop` run; FLAKE_REF is relative to DIR.
+#   CI entrypoints may opt into Bash; component hooks use POSIX sh by default.
+#   ENV=VALUE pairs are set for `nix develop` itself, not only for the script:
+#   a flake's shellHook runs before the `-c` command, and the opensecret shell
+#   starts PostgreSQL and writes .env unless OPENSECRET_DEV_* tell it not to.
+#   `nix develop` passes its environment through, so the script sees them too.
+run_component() {
+    name=$1; dir=$2; flake_ref=$3; script=$4
+    shift 4
+    component_shell=sh
+    if [ "${1:-}" = "--bash" ]; then
+        component_shell=bash
+        shift
+    fi
+    hook_log "=== $name ==="
+    started=$(date +%s)
+    # Git exports GIT_INDEX_FILE, GIT_DIR, and friends to hooks. They must not
+    # leak into the checks: nested git commands (for example the scripts/ci
+    # tests' fixture repositories) would otherwise operate on this checkout.
+    # shellcheck disable=SC2086 # GIT_ENV_UNSET is a deliberate word list
+    if [ -n "$NIX_BIN" ]; then
+        (cd "$dir" && env $GIT_ENV_UNSET "$@" "$NIX_BIN" develop --no-update-lock-file "$flake_ref" \
+            -c env MAPLE_HOOK_IN_NIX=1 "$component_shell" "$script")
+    else
+        # shellcheck disable=SC2086
+        (cd "$dir" && env $GIT_ENV_UNSET MAPLE_HOOK_IN_NIX=0 "$@" "$component_shell" "$script")
+    fi
+    status=$?
+    hook_log "=== $name finished in $(( $(date +%s) - started ))s ==="
+    [ "$status" -eq 0 ] || exit "$status"
+}
+
+if hook_selected repo; then
+    run_component repo "$REPO_ROOT" ".#ci" "$REPO_ROOT/.githooks/repo-checks"
+fi
+if hook_selected research_frontend || hook_selected research_rust; then
+    run_component maple-research "$REPO_ROOT" ".#ci" "$REPO_ROOT/apps/maple-research/.githooks/pre-commit"
+fi
+if hook_selected auth; then
+    run_component maple-auth "$REPO_ROOT" ".#ci" "$REPO_ROOT/apps/maple-auth/.githooks/pre-commit"
+fi
+if hook_selected updates; then
+    run_component updates "$REPO_ROOT" ".#ci" "$REPO_ROOT/services/updates/.githooks/pre-commit"
+fi
+if hook_selected agent_updates; then
+    run_component agent-updates "$REPO_ROOT" ".#ci" "$REPO_ROOT/scripts/ci/agent-updates.sh" --bash
+fi
+if hook_selected sdk_rust || hook_selected sdk_ts; then
+    run_component sdk "$REPO_ROOT/sdk" "." "$REPO_ROOT/sdk/.githooks/pre-commit"
+fi
+if hook_selected proxy; then
+    run_component proxy "$REPO_ROOT/proxy" "." "$REPO_ROOT/proxy/.githooks/pre-commit"
+fi
+if hook_selected agent; then
+    run_component maple-agent "$REPO_ROOT/apps/maple-agent" "." "$REPO_ROOT/apps/maple-agent/.githooks/pre-commit"
+fi
+if hook_selected opensecret; then
+    for submodule in privatemode-public; do
+        if [ ! -e "$REPO_ROOT/services/opensecret/$submodule/.git" ]; then
+            hook_fail "services/opensecret/$submodule is not checked out; CI would fail. Run: git submodule update --init --recursive"
+        fi
+    done
+    run_component opensecret "$REPO_ROOT/services/opensecret" ".?submodules=1" \
+        "$REPO_ROOT/services/opensecret/.githooks/pre-commit" \
+        OPENSECRET_DEV_POSTGRES=0 OPENSECRET_DEV_ENV=0 OPENSECRET_DEV_CONTAINERS=0
+fi
+
+hook_log "All selected checks passed."
+exit 0

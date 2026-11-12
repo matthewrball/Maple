@@ -1,0 +1,625 @@
+name: Publish proxy container
+
+run-name: Publish the current maple-proxy container to GHCR
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      diagnostics_only:
+        description: Inspect package API access without building or publishing
+        type: boolean
+        default: false
+      bootstrap_only:
+        description: Initialize the first package with untagged release images only
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proxy-publishing
+  queue: max
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: mapleprivacylabs/maple-proxy
+  UNBACKFILLED_PROXY_BASELINE: 0.3.3
+
+jobs:
+  diagnose:
+    name: Diagnose proxy package access
+    if: >-
+      github.repository == 'MaplePrivacyLabs/Maple' &&
+      github.repository_id == '923138240' &&
+      github.repository_owner_id == '322649754' &&
+      github.ref_type == 'branch' &&
+      github.event_name == 'workflow_dispatch' && inputs.diagnostics_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Inspect package API responses without publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/ci/proxy_registry_inventory.py --diagnose
+
+  prepare:
+    name: Validate proxy publication
+    if: >-
+      github.repository == 'MaplePrivacyLabs/Maple' &&
+      github.repository_id == '923138240' &&
+      github.repository_owner_id == '322649754' &&
+      github.ref == 'refs/heads/master' &&
+      !(github.event_name == 'workflow_dispatch' && inputs.diagnostics_only) &&
+      ((github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'release' &&
+        startsWith(github.event.workflow_run.head_branch, 'v') &&
+        github.event.workflow_run.path == '.github/workflows/release.yml' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      reconcile: ${{ steps.plan.outputs.reconcile }}
+      bootstrap: ${{ steps.plan.outputs.bootstrap }}
+      release_sha: ${{ steps.plan.outputs.release_sha }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      proxy_version: ${{ steps.plan.outputs.proxy_version }}
+      major: ${{ steps.plan.outputs.major }}
+      minor: ${{ steps.plan.outputs.minor }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the publication plan
+        id: plan
+        env:
+          EXPECTED_RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
+          EXPECTED_RELEASE_TAG: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || '' }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BOOTSTRAP_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap_only }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "Proxy container publication failed: $*" >&2
+            exit 1
+          }
+
+          api() {
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$@"
+          }
+
+          proxy_version_at_sha() {
+            local sha="$1"
+            git cat-file -e "${sha}^{commit}" 2>/dev/null || \
+              fail "commit ${sha} is unavailable in the trusted checkout"
+            if ! git cat-file -e "${sha}:proxy/Cargo.toml" 2>/dev/null; then
+              return 0
+            fi
+            local manifest
+            manifest="$(git show "${sha}:proxy/Cargo.toml")"
+            awk '
+              /^\[package\]$/ { in_package = 1; next }
+              /^\[/ && in_package { exit }
+              in_package && /^version = "/ {
+                value = $0
+                sub(/^version = "/, "", value)
+                sub(/".*$/, "", value)
+                print value
+                exit
+              }
+            ' <<<"${manifest}"
+          }
+
+          latest_release="$(api "repos/${REPOSITORY}/releases/latest")"
+          release_id="$(jq -er 'select(.draft == false and .prerelease == false) | .id' <<<"${latest_release}")"
+          release_tag="$(jq -er '.tag_name' <<<"${latest_release}")"
+          [[ "${release_tag}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || \
+            fail "latest stable release must use an exact vX.Y.Z tag"
+
+          if [ -n "${EXPECTED_RELEASE_TAG}" ] && [ "${release_tag}" != "${EXPECTED_RELEASE_TAG}" ]; then
+            echo "${EXPECTED_RELEASE_TAG} is no longer the latest stable release; skipping proxy publication."
+            echo "publish=false" >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          release_sha="$(api "repos/${REPOSITORY}/commits/${release_tag}" --jq '.sha')"
+          [[ "${release_sha}" =~ ^[0-9a-f]{40}$ ]] || fail "release SHA is invalid"
+          if [ -n "${EXPECTED_RELEASE_SHA}" ] && [ "${release_sha}" != "${EXPECTED_RELEASE_SHA}" ]; then
+            fail "release tag no longer resolves to the completed workflow SHA"
+          fi
+
+          master_status="$(api "repos/${REPOSITORY}/compare/${release_sha}...master" --jq '.status')"
+          case "${master_status}" in
+            ahead|identical) ;;
+            *) fail "release SHA is not reachable from protected master" ;;
+          esac
+
+          releases="$(api "repos/${REPOSITORY}/releases?per_page=100")"
+          previous_release="$(
+            jq -ec --argjson current_id "${release_id}" '
+              [ .[] |
+                select(.draft == false and .prerelease == false and .id != $current_id)
+              ] | first
+            ' <<<"${releases}"
+          )" || fail "no previous stable Maple release is available for comparison"
+          previous_tag="$(jq -er '.tag_name' <<<"${previous_release}")"
+          [[ "${previous_tag}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || \
+            fail "previous stable release must use an exact vX.Y.Z tag"
+          previous_sha="$(api "repos/${REPOSITORY}/commits/${previous_tag}" --jq '.sha')"
+          [[ "${previous_sha}" =~ ^[0-9a-f]{40}$ ]] || fail "previous release SHA is invalid"
+          git merge-base --is-ancestor "${previous_sha}" "${release_sha}" || \
+            fail "previous stable release is not an ancestor of the current release"
+
+          proxy_version="$(proxy_version_at_sha "${release_sha}")"
+          previous_proxy_version="$(proxy_version_at_sha "${previous_sha}")"
+          [ -n "${proxy_version}" ] || fail "current release has no proxy package version"
+
+          if [ -n "${previous_proxy_version}" ]; then
+            set +e
+            python3 -I scripts/ci/proxy_runtime_diff.py \
+              "${previous_sha}" "${release_sha}"
+            runtime_diff_status=$?
+            set -e
+            case "${runtime_diff_status}" in
+              0) ;;
+              1)
+                [ "${proxy_version}" != "${previous_proxy_version}" ] || \
+                  fail "proxy container runtime inputs changed without a proxy version bump"
+                ;;
+              *) fail "could not compare proxy container runtime inputs between releases" ;;
+            esac
+          fi
+
+          # Explicit first-package initialization only uploads by digest. It does
+          # not admit an empty inventory or authorize any version/alias tag.
+          if [ "${BOOTSTRAP_ONLY}" = "true" ]; then
+            python3 -I scripts/ci/proxy_registry_inventory.py --prepare-bootstrap \
+              "${proxy_version}" "${previous_proxy_version}" "${UNBACKFILLED_PROXY_BASELINE}"
+            {
+              echo "bootstrap=true"
+              echo "publish=false"
+              echo "reconcile=false"
+              echo "proxy_version=${proxy_version}"
+              echo "release_sha=${release_sha}"
+              echo "release_tag=${release_tag}"
+            } >>"${GITHUB_OUTPUT}"
+            {
+              echo "### Initialize proxy package"
+              echo "Upload the validated release images by digest only; no version or alias tags."
+              echo "After the builds finish, make the package public and rerun with bootstrap_only disabled."
+            } >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          # Only authenticated package metadata can confirm initial creation.
+          # Anonymous denial/network errors must never mean an empty registry.
+          python3 -I scripts/ci/proxy_registry_inventory.py \
+            >"${RUNNER_TEMP}/proxy-tags.json"
+
+          plan="${RUNNER_TEMP}/proxy-publish-plan"
+          ./scripts/ci/plan-proxy-container-publish.sh \
+            "${proxy_version}" "${previous_proxy_version}" \
+            "${UNBACKFILLED_PROXY_BASELINE}" \
+            "${RUNNER_TEMP}/proxy-tags.json" >"${plan}"
+          cat "${plan}" >>"${GITHUB_OUTPUT}"
+          {
+            echo "release_sha=${release_sha}"
+            echo "release_tag=${release_tag}"
+          } >>"${GITHUB_OUTPUT}"
+
+          # The planner emits only validated shell-safe identifiers and versions.
+          # shellcheck disable=SC1090
+          source "${plan}"
+          case "${reason}" in
+            baseline)
+              detail="maple-proxy ${proxy_version} remains the explicit unbackfilled migration baseline"
+              ;;
+            already-published)
+              detail="maple-proxy ${proxy_version} already exists in GHCR and will be verified with its aliases"
+              ;;
+            missing-version)
+              detail="maple-proxy ${proxy_version} is missing from GHCR and will be recovered"
+              ;;
+            new-version)
+              detail="maple-proxy advances from ${previous_proxy_version} to ${proxy_version}"
+              ;;
+            *) fail "publish planner returned an unknown reason" ;;
+          esac
+          {
+            echo "### Proxy container"
+            echo
+            echo "${detail}."
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+  build:
+    name: Build proxy container (${{ matrix.platform }})
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true' || needs.prepare.outputs.bootstrap == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            artifact: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            artifact: arm64
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push platform image by digest
+        id: image
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .
+          file: proxy/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.release_sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.proxy_version }}
+          cache-from: type=gha,scope=proxy-publish-${{ matrix.platform }}
+          # Cache availability must not turn a successful image build/push into a failure.
+          cache-to: type=gha,mode=max,scope=proxy-publish-${{ matrix.platform }},ignore-error=true
+          provenance: mode=max
+          sbom: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export platform digest
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload platform digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: proxy-container-digest-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish immutable proxy version
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: proxy-container-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish the exact multi-platform manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROXY_VERSION: ${{ needs.prepare.outputs.proxy_version }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+
+          current_release_sha="$(
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq '.sha'
+          )"
+          [ "${current_release_sha}" = "${RELEASE_SHA}" ] || {
+            echo "Release tag changed during proxy publication." >&2
+            exit 1
+          }
+          current_release_tag="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name'
+          )"
+          [ "${current_release_tag}" = "${RELEASE_TAG}" ] || {
+            echo "A newer stable Maple release appeared during proxy publication." >&2
+            exit 1
+          }
+
+          digest_files=(*)
+          [ "${#digest_files[@]}" -eq 2 ] || {
+            echo "Expected exactly two platform digests." >&2
+            exit 1
+          }
+          image="${REGISTRY}/${IMAGE_NAME}"
+          sources=()
+          for digest in "${digest_files[@]}"; do
+            [[ "${digest}" =~ ^[0-9a-f]{64}$ ]]
+            sources+=("${image}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create \
+            --tag "${image}:${PROXY_VERSION}" \
+            "${sources[@]}"
+
+  finalize:
+    name: Verify proxy image and reconcile aliases
+    needs:
+      - prepare
+      - build
+      - publish
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      (needs.prepare.outputs.publish == 'true' || needs.prepare.outputs.reconcile == 'true') &&
+      (needs.prepare.outputs.publish != 'true' || needs.publish.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download platform digests
+        if: needs.prepare.outputs.publish == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: proxy-container-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Verify the exact image and reconcile mutable aliases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROXY_VERSION: ${{ needs.prepare.outputs.proxy_version }}
+          PROXY_MAJOR: ${{ needs.prepare.outputs.major }}
+          PROXY_MINOR: ${{ needs.prepare.outputs.minor }}
+          PUBLISHED_NOW: ${{ needs.prepare.outputs.publish }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "Proxy container reconciliation failed: $*" >&2
+            exit 1
+          }
+
+          proxy_version_at_sha() {
+            local sha="$1"
+            git cat-file -e "${sha}^{commit}" 2>/dev/null || \
+              fail "image revision ${sha} is unavailable in the trusted checkout"
+            git cat-file -e "${sha}:proxy/Cargo.toml" 2>/dev/null || \
+              fail "image revision ${sha} has no proxy manifest"
+            git show "${sha}:proxy/Cargo.toml" | awk '
+              /^\[package\]$/ { in_package = 1; next }
+              /^\[/ && in_package { exit }
+              in_package && /^version = "/ {
+                value = $0
+                sub(/^version = "/, "", value)
+                sub(/".*$/, "", value)
+                print value
+                exit
+              }
+            '
+          }
+
+          assert_release_is_current() {
+            local current_release_sha current_release_tag
+            current_release_sha="$(
+              gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq '.sha'
+            )"
+            [ "${current_release_sha}" = "${RELEASE_SHA}" ] || \
+              fail "release tag changed during proxy publication"
+            current_release_tag="$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name'
+            )"
+            [ "${current_release_tag}" = "${RELEASE_TAG}" ] || \
+              fail "a newer stable Maple release appeared during proxy publication"
+          }
+
+          assert_runtime_inputs_unchanged() {
+            local from_sha="$1"
+            local diff_status
+            set +e
+            python3 -I scripts/ci/proxy_runtime_diff.py \
+              "${from_sha}" "${RELEASE_SHA}"
+            diff_status=$?
+            set -e
+            case "${diff_status}" in
+              0) ;;
+              1) fail "published exact tag does not match the current proxy runtime inputs" ;;
+              *) fail "could not compare the published image revision with the release" ;;
+            esac
+          }
+
+          assert_release_is_current
+          # GitHub creates a new container package as private. An operator must
+          # make it public before anonymous verification or alias publication.
+          # This workflow never changes package visibility on the user's behalf.
+          python3 -I scripts/ci/proxy_registry_inventory.py --require-public >/dev/null
+          image="${REGISTRY}/${IMAGE_NAME}"
+          source_digest_dir=""
+          if [ "${PUBLISHED_NOW}" = "true" ]; then
+            source_digest_dir="${RUNNER_TEMP}/digests"
+          fi
+
+          inspection_args=(
+            "${REGISTRY}"
+            "${IMAGE_NAME}"
+            "${PROXY_VERSION}"
+            "${PROXY_VERSION}"
+            "https://github.com/${GITHUB_REPOSITORY}"
+          )
+          if [ -n "${source_digest_dir}" ]; then
+            inspection_args+=("${source_digest_dir}")
+          fi
+          inspection="$(
+            "${GITHUB_WORKSPACE}/scripts/ci/inspect-proxy-container-manifest.sh" \
+              "${inspection_args[@]}"
+          )"
+          manifest_digest="$(awk -F= '$1 == "manifest_digest" { print $2 }' <<<"${inspection}")"
+          image_revision="$(awk -F= '$1 == "image_revision" { print $2 }' <<<"${inspection}")"
+          [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+            fail "inspector returned an invalid exact manifest digest"
+          [[ "${image_revision}" =~ ^[0-9a-f]{40}$ ]] || \
+            fail "inspector returned an invalid image revision"
+
+          if [ "${PUBLISHED_NOW}" = "true" ]; then
+            [ "${image_revision}" = "${RELEASE_SHA}" ] || \
+              fail "new exact tag was not built from the validated release SHA"
+          else
+            git merge-base --is-ancestor "${image_revision}" "${RELEASE_SHA}" || \
+              fail "published image revision is not an ancestor of the current release"
+            [ "$(proxy_version_at_sha "${image_revision}")" = "${PROXY_VERSION}" ] || \
+              fail "published image revision has a different proxy version"
+            assert_runtime_inputs_unchanged "${image_revision}"
+          fi
+
+          registry_token="$(
+            curl --fail --silent --show-error \
+              "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull" | jq -er '.token'
+          )"
+
+          remote_digest() {
+            local tag="$1"
+            local headers status digest
+            headers="$(mktemp)"
+            status="$(
+              curl --silent --show-error --head --output /dev/null \
+                --write-out '%{http_code}' \
+                --header "Authorization: Bearer ${registry_token}" \
+                --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+                --dump-header "${headers}" \
+                "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${tag}"
+            )"
+            if [ "${status}" = "404" ]; then
+              return 1
+            fi
+            [ "${status}" = "200" ] || fail "manifest ${tag} returned HTTP ${status}"
+            digest="$(awk 'tolower($1) == "docker-content-digest:" { gsub("\\r", "", $2); print $2 }' "${headers}")"
+            [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+              fail "manifest ${tag} returned an invalid digest"
+            printf '%s\n' "${digest}"
+          }
+
+          wait_for_digest() {
+            local tag="$1"
+            local expected="$2"
+            local observed=""
+            for _ in {1..12}; do
+              if observed="$(remote_digest "${tag}")" && [ "${observed}" = "${expected}" ]; then
+                return 0
+              fi
+              sleep 5
+            done
+            fail "tag ${tag} did not converge to ${expected}; last observed ${observed:-missing}"
+          }
+
+          [ "$(remote_digest "${PROXY_VERSION}")" = "${manifest_digest}" ] || \
+            fail "exact version tag changed after validation"
+          assert_release_is_current
+
+          repaired=()
+          for tag in "${PROXY_MINOR}" "${PROXY_MAJOR}" latest; do
+            observed=""
+            if observed="$(remote_digest "${tag}")" && [ "${observed}" = "${manifest_digest}" ]; then
+              continue
+            fi
+            docker buildx imagetools create \
+              --tag "${image}:${tag}" \
+              "${image}@${manifest_digest}"
+            wait_for_digest "${tag}" "${manifest_digest}"
+            repaired+=("${tag}")
+          done
+
+          docker logout "${REGISTRY}"
+          for tag in "${PROXY_VERSION}" "${PROXY_MINOR}" "${PROXY_MAJOR}" latest; do
+            wait_for_digest "${tag}" "${manifest_digest}"
+          done
+
+          if [ "${PUBLISHED_NOW}" = "true" ]; then
+            action="Published"
+          else
+            action="Verified"
+          fi
+          if [ "${#repaired[@]}" -eq 0 ]; then
+            repair_detail="All mutable aliases were already current."
+          else
+            repair_detail="Repaired aliases: ${repaired[*]}."
+          fi
+
+          {
+            echo "### Proxy container"
+            echo
+            echo "${action} \`${image}:${PROXY_VERSION}\` from Maple \`${RELEASE_TAG}\` using image revision \`${image_revision}\`."
+            echo "Exact, minor, major, and latest tags resolve to \`${manifest_digest}\`."
+            echo "Verified anonymous Linux AMD64/ARM64 images and per-platform SLSA provenance."
+            echo "${repair_detail}"
+          } >>"${GITHUB_STEP_SUMMARY}"

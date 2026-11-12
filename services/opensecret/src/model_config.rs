@@ -1,0 +1,2310 @@
+//! Central model-specific configuration and public model catalog.
+
+use crate::inference::auto_model::auto_model_candidates;
+use crate::inference::ModelSelectionMode;
+use serde_json::{json, Value};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelConfig {
+    pub context_window: usize,
+    pub responses: ResponsesModelConfig,
+    /// How the model exposes reasoning effort; `None` for models that never
+    /// reason and for models outside the catalog.
+    pub reasoning: Option<ModelReasoning>,
+    /// The model's renderer rejects OpenAI's `developer` role, so requests
+    /// carry those messages as `system`.
+    pub developer_role_as_system: bool,
+}
+
+/// One value of OpenAI's `reasoning_effort` enum, ordered from least to most
+/// reasoning so an unsupported request can be moved to the nearest effort a
+/// model accepts. The wire spelling is `as_str`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Every value, lowest effort first.
+    pub const ALL: [Self; 7] = [
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse the exact OpenAI spelling; anything else is not an effort.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|effort| effort.as_str() == value)
+    }
+}
+
+/// A set of reasoning efforts, small enough to live in `const` model tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReasoningEffortSet(u8);
+
+impl ReasoningEffortSet {
+    pub const fn of(efforts: &[ReasoningEffort]) -> Self {
+        let mut bits = 0u8;
+        let mut index = 0;
+        while index < efforts.len() {
+            bits |= 1 << efforts[index] as u8;
+            index += 1;
+        }
+        Self(bits)
+    }
+
+    pub const fn contains(self, effort: ReasoningEffort) -> bool {
+        self.0 & (1 << effort as u8) != 0
+    }
+
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    #[cfg(test)]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Members, lowest effort first.
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = ReasoningEffort> {
+        ReasoningEffort::ALL
+            .into_iter()
+            .filter(move |effort| self.contains(*effort))
+    }
+}
+
+/// How a model exposes reasoning effort: the catalog `reasoning` object
+/// (OpenRouter's `ModelReasoning` shape, the shape third-party catalogs
+/// already use for these model families) and the rule every request is
+/// checked against after alias resolution.
+///
+/// Values were verified live against both providers on 2026-10-07 (Maple
+/// issue #1087). Re-verify them whenever a provider upgrades its engine: the
+/// level names stay valid across vLLM versions, the budgets behind them move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelReasoning {
+    /// Reasoning cannot be turned off: `none` is rejected on an explicit model
+    /// and moved to the lowest accepted effort on an alias.
+    pub mandatory: bool,
+    /// The model reasons when a request names no effort.
+    pub default_enabled: bool,
+    /// Accepted efforts. `None` when the model has no tiers: any effort other
+    /// than `none` turns reasoning on.
+    pub supported_efforts: Option<ReasoningEffortSet>,
+    /// The effort used when a request names none; `None` for models without
+    /// tiers.
+    pub default_effort: Option<ReasoningEffort>,
+}
+
+impl ModelReasoning {
+    const fn tiers(
+        mandatory: bool,
+        supported_efforts: ReasoningEffortSet,
+        default_effort: ReasoningEffort,
+    ) -> Self {
+        Self {
+            mandatory,
+            default_enabled: true,
+            supported_efforts: Some(supported_efforts),
+            default_effort: Some(default_effort),
+        }
+    }
+
+    const fn toggle(default_enabled: bool) -> Self {
+        Self {
+            mandatory: false,
+            default_enabled,
+            supported_efforts: None,
+            default_effort: None,
+        }
+    }
+
+    /// Whether a request may name this effort for the model.
+    pub fn accepts(self, effort: ReasoningEffort) -> bool {
+        if effort == ReasoningEffort::None {
+            return !self.mandatory;
+        }
+        self.supported_efforts
+            .is_none_or(|efforts| efforts.contains(effort))
+    }
+
+    /// Every effort a request may name, lowest first.
+    pub fn accepted_efforts(self) -> Vec<ReasoningEffort> {
+        ReasoningEffort::ALL
+            .into_iter()
+            .filter(|effort| self.accepts(*effort))
+            .collect()
+    }
+
+    /// The nearest accepted effort: the requested one when accepted, else the
+    /// next higher accepted effort, else the next lower one. This is the rule
+    /// Pi applies on the client; the server applies it to Auto aliases, whose
+    /// resolved model can change between requests.
+    pub fn clamp(self, requested: ReasoningEffort) -> ReasoningEffort {
+        if self.accepts(requested) {
+            return requested;
+        }
+        let accepted = self.accepted_efforts();
+        accepted
+            .iter()
+            .copied()
+            .find(|effort| *effort > requested)
+            .or_else(|| {
+                accepted
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|effort| *effort < requested)
+            })
+            .unwrap_or(requested)
+    }
+
+    /// What an alias can promise: the efforts every model it may resolve to
+    /// accepts. The preferred target's defaults stand, since it serves unless
+    /// it is unavailable.
+    fn intersect(self, other: Self) -> Self {
+        Self {
+            mandatory: self.mandatory || other.mandatory,
+            default_enabled: self.default_enabled,
+            supported_efforts: match (self.supported_efforts, other.supported_efforts) {
+                (Some(mine), Some(theirs)) => Some(mine.intersection(theirs)),
+                (Some(efforts), None) | (None, Some(efforts)) => Some(efforts),
+                (None, None) => None,
+            },
+            default_effort: self.default_effort,
+        }
+    }
+
+    /// The catalog `reasoning` object. `supported_efforts` lists the highest
+    /// effort first, as OpenRouter does.
+    pub fn json(self) -> Value {
+        let mut value = json!({
+            "mandatory": self.mandatory,
+            "default_enabled": self.default_enabled,
+        });
+        if let Some(efforts) = self.supported_efforts {
+            value["supported_efforts"] = Value::Array(
+                efforts
+                    .iter()
+                    .rev()
+                    .map(|effort| json!(effort.as_str()))
+                    .collect(),
+            );
+        }
+        if let Some(default_effort) = self.default_effort {
+            value["default_effort"] = json!(default_effort.as_str());
+        }
+        value
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResponsesModelConfig {
+    /// The model creator's recommended sampling. `None` only for models outside
+    /// the catalog, whose requests omit sampling so the provider's default applies.
+    pub sampling: Option<SamplingConfig>,
+    pub include_reasoning: bool,
+    pub enable_thinking: bool,
+    pub reasoning_history: ReasoningHistoryStrategy,
+}
+
+/// Sampling published by a model's creator. Every catalog model states its own
+/// values with their source; there is no shared default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingConfig {
+    pub temperature: f32,
+    pub top_p: f32,
+    /// Replaces `top_p` for turns that offer tools, where the creator publishes
+    /// a separate agentic value.
+    pub tool_use_top_p: Option<f32>,
+    pub top_k: Option<u32>,
+}
+
+/// How a model's creator says prior reasoning must be replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningHistoryStrategy {
+    /// The model has no replayable reasoning, or the creator publishes no rule.
+    Omit,
+    /// Drop reasoning from earlier turns; keep it within the current turn's
+    /// tool calls (Gemma 4, gpt-oss harmony).
+    CurrentTurn,
+    /// Kimi K3 was trained with preserved thinking and requires all of it.
+    KimiPreserveThinking,
+    /// GLM 5.3 chat use passes `clear_thinking=true`, which keeps only the
+    /// current turn's reasoning.
+    GlmClearThinking,
+    /// DeepSeek V4.1 keeps every turn's reasoning when tools are present and
+    /// drops it otherwise.
+    DeepSeekToolsOnly,
+}
+
+/// Serialize an `f32` by its shortest decimal form, so 0.95 is sent as 0.95
+/// rather than its widened `f64` value 0.949999988079071.
+fn exact_json_number(value: f32) -> Value {
+    value
+        .to_string()
+        .parse::<f64>()
+        .map_or_else(|_| json!(value), |exact| json!(exact))
+}
+
+/// The reasoning a request replays, resolved for one model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningReplay {
+    None,
+    /// Only reasoning after the last user message in the context.
+    CurrentTurn,
+    All,
+}
+
+impl ReasoningHistoryStrategy {
+    pub fn replay(self, tools_enabled: bool) -> ReasoningReplay {
+        match self {
+            Self::Omit => ReasoningReplay::None,
+            Self::CurrentTurn | Self::GlmClearThinking => ReasoningReplay::CurrentTurn,
+            Self::KimiPreserveThinking => ReasoningReplay::All,
+            Self::DeepSeekToolsOnly if tools_enabled => ReasoningReplay::All,
+            Self::DeepSeekToolsOnly => ReasoningReplay::None,
+        }
+    }
+
+    /// The chat-template switch that makes the provider render the same history.
+    pub fn chat_template_kwarg(self) -> Option<(&'static str, Value)> {
+        match self {
+            Self::KimiPreserveThinking => Some(("preserve_thinking", json!(true))),
+            Self::GlmClearThinking => Some(("clear_thinking", json!(true))),
+            Self::Omit | Self::CurrentTurn | Self::DeepSeekToolsOnly => None,
+        }
+    }
+}
+
+impl ReasoningReplay {
+    /// Context built before the new user message is persisted has no current
+    /// turn yet, so current-turn replay has nothing to include.
+    pub fn before_new_user_message(self) -> Self {
+        match self {
+            Self::CurrentTurn => Self::None,
+            other => other,
+        }
+    }
+}
+
+impl SamplingConfig {
+    const fn new(temperature: f32, top_p: f32) -> Self {
+        Self {
+            temperature,
+            top_p,
+            tool_use_top_p: None,
+            top_k: None,
+        }
+    }
+
+    const fn with_tool_use_top_p(mut self, top_p: f32) -> Self {
+        self.tool_use_top_p = Some(top_p);
+        self
+    }
+
+    const fn with_top_k(mut self, top_k: u32) -> Self {
+        self.top_k = Some(top_k);
+        self
+    }
+
+    /// Write this sampling into an OpenAI-compatible request.
+    pub fn apply_to_request(self, request: &mut Value, tools_enabled: bool) {
+        request["temperature"] = exact_json_number(self.temperature);
+        request["top_p"] = exact_json_number(self.top_p_for(tools_enabled));
+        if let Some(top_k) = self.top_k {
+            request["top_k"] = json!(top_k);
+        }
+    }
+
+    pub fn top_p_for(self, tools_enabled: bool) -> f32 {
+        match self.tool_use_top_p {
+            Some(top_p) if tools_enabled => top_p,
+            _ => self.top_p,
+        }
+    }
+
+    /// Apply explicit caller values over the recommendation.
+    pub fn with_overrides(self, temperature: Option<f32>, top_p: Option<f32>) -> Self {
+        Self {
+            temperature: temperature.unwrap_or(self.temperature),
+            top_p: top_p.unwrap_or(self.top_p),
+            tool_use_top_p: if top_p.is_some() {
+                None
+            } else {
+                self.tool_use_top_p
+            },
+            top_k: self.top_k,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelConfigEntry {
+    id: &'static str,
+    catalog_provider: &'static str,
+    catalog_provider_id: &'static str,
+    display_name: &'static str,
+    short_name: &'static str,
+    description: &'static str,
+    access: ModelAccessTier,
+    capabilities: ModelCapabilities,
+    badges: &'static [&'static str],
+    listed: bool,
+    api_listed: bool,
+    enabled: bool,
+    deprecated: bool,
+    sort_order: u16,
+    config: ModelConfig,
+    catalog_metadata: Option<ModelCatalogMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAccessTier {
+    Free,
+    Pro,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ModelPlan {
+    #[default]
+    Free,
+    Paid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    pub chat: bool,
+    pub vision: bool,
+    pub reasoning: bool,
+    pub tool_use: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelCatalogMetadata {
+    input_modalities: &'static [&'static str],
+    output_modalities: &'static [&'static str],
+    parameter_size: Option<&'static str>,
+    active_parameter_size: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelAliasEntry {
+    id: &'static str,
+    label: &'static str,
+    short_name: &'static str,
+    description: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ModelAliasTargets {
+    quick: &'static str,
+    powerful: &'static str,
+}
+
+pub const DEFAULT_CONTEXT_WINDOW: usize = 64_000;
+pub const AUTO_QUICK_MODEL_ID: &str = "auto:quick";
+pub const AUTO_POWERFUL_MODEL_ID: &str = "auto:powerful";
+pub const QUICK_MODEL_ID: &str = "gpt-oss-120b";
+pub const GLM_5_3_MODEL_ID: &str = "glm-5-3";
+pub const GLM_5_3_FLASH_MODEL_ID: &str = "glm-5-3-flash";
+pub const POWERFUL_MODEL_ID: &str = GLM_5_3_MODEL_ID;
+pub const KIMI_K3_MODEL_ID: &str = "kimi-k3";
+pub const DEEPSEEK_V4_1_FLASH_MODEL_ID: &str = "deepseek-v4-1-flash";
+pub const DEEPSEEK_V4_1_FLASH_UNCENSORED_MODEL_ID: &str = "deepseek-v4-1-flash-1017-uncensored";
+pub const DECISION_SMALL_MODEL_ID: &str = "decision-small";
+pub const DECISION_MEDIUM_MODEL_ID: &str = "decision-medium";
+pub const DECISION_LARGE_MODEL_ID: &str = "decision-large";
+
+/// A typed-decision model: it answers System One questions and nothing else, so it is in
+/// neither chat catalog and never resolves as a completion model. The limits are those of
+/// the serving deployment (Tinfoil's vLLM d3 family behind `/v1/decisions`): text only, at
+/// most 26 lettered options per choice, and one question's prompt within the context window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecisionModel {
+    pub(crate) id: &'static str,
+    pub(crate) access: ModelAccessTier,
+    /// Tokens one question's prompt (state, question and options) may take.
+    pub(crate) context_window: usize,
+    pub(crate) max_choice_options: usize,
+}
+
+impl DecisionModel {
+    const fn pro(id: &'static str) -> Self {
+        Self {
+            id,
+            access: ModelAccessTier::Pro,
+            context_window: 32_768,
+            max_choice_options: 26,
+        }
+    }
+}
+
+const DECISION_MODELS: &[DecisionModel] = &[
+    DecisionModel::pro(DECISION_SMALL_MODEL_ID),
+    DecisionModel::pro(DECISION_MEDIUM_MODEL_ID),
+    DecisionModel::pro(DECISION_LARGE_MODEL_ID),
+];
+
+pub(crate) fn decision_model(model: &str) -> Option<DecisionModel> {
+    DECISION_MODELS
+        .iter()
+        .find(|entry| entry.id == model)
+        .copied()
+}
+
+#[cfg(test)]
+pub(crate) fn decision_models() -> &'static [DecisionModel] {
+    DECISION_MODELS
+}
+
+const FREE_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
+    quick: QUICK_MODEL_ID,
+    powerful: POWERFUL_MODEL_ID,
+};
+
+const PAID_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
+    quick: GLM_5_3_FLASH_MODEL_ID,
+    powerful: POWERFUL_MODEL_ID,
+};
+
+/// Models outside the catalog send no sampling and replay no reasoning.
+const UNCATALOGED_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig {
+    sampling: None,
+    include_reasoning: false,
+    enable_thinking: false,
+    reasoning_history: ReasoningHistoryStrategy::Omit,
+};
+
+impl ResponsesModelConfig {
+    const fn recommended(
+        sampling: SamplingConfig,
+        reasoning_history: ReasoningHistoryStrategy,
+    ) -> Self {
+        Self {
+            sampling: Some(sampling),
+            include_reasoning: false,
+            enable_thinking: false,
+            reasoning_history,
+        }
+    }
+
+    const fn with_thinking_enabled(mut self) -> Self {
+        self.include_reasoning = true;
+        self.enable_thinking = true;
+        self
+    }
+}
+
+impl ModelConfigEntry {
+    #[allow(clippy::too_many_arguments)]
+    const fn new(
+        id: &'static str,
+        display_name: &'static str,
+        short_name: &'static str,
+        description: &'static str,
+        access: ModelAccessTier,
+        capabilities: ModelCapabilities,
+        badges: &'static [&'static str],
+        listed: bool,
+        enabled: bool,
+        deprecated: bool,
+        sort_order: u16,
+        context_window: usize,
+        responses: ResponsesModelConfig,
+    ) -> Self {
+        Self {
+            id,
+            catalog_provider: "tinfoil",
+            catalog_provider_id: id,
+            display_name,
+            short_name,
+            description,
+            access,
+            capabilities,
+            badges,
+            listed,
+            api_listed: listed,
+            enabled,
+            deprecated,
+            sort_order,
+            config: ModelConfig {
+                context_window,
+                responses,
+                reasoning: None,
+                developer_role_as_system: false,
+            },
+            catalog_metadata: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    const fn api_only(
+        id: &'static str,
+        display_name: &'static str,
+        short_name: &'static str,
+        description: &'static str,
+        access: ModelAccessTier,
+        capabilities: ModelCapabilities,
+        badges: &'static [&'static str],
+        enabled: bool,
+        deprecated: bool,
+        sort_order: u16,
+        context_window: usize,
+        responses: ResponsesModelConfig,
+    ) -> Self {
+        Self {
+            id,
+            catalog_provider: "tinfoil",
+            catalog_provider_id: id,
+            display_name,
+            short_name,
+            description,
+            access,
+            capabilities,
+            badges,
+            listed: false,
+            api_listed: true,
+            enabled,
+            deprecated,
+            sort_order,
+            config: ModelConfig {
+                context_window,
+                responses,
+                reasoning: None,
+                developer_role_as_system: false,
+            },
+            catalog_metadata: None,
+        }
+    }
+
+    const fn with_catalog_provider(
+        mut self,
+        provider: &'static str,
+        provider_id: &'static str,
+    ) -> Self {
+        self.catalog_provider = provider;
+        self.catalog_provider_id = provider_id;
+        self
+    }
+
+    const fn with_catalog_metadata(mut self, metadata: ModelCatalogMetadata) -> Self {
+        self.catalog_metadata = Some(metadata);
+        self
+    }
+
+    const fn with_reasoning(mut self, reasoning: ModelReasoning) -> Self {
+        self.config.reasoning = Some(reasoning);
+        self
+    }
+
+    const fn with_developer_role_as_system(mut self) -> Self {
+        self.config.developer_role_as_system = true;
+        self
+    }
+
+    /// vLLM has no output cap of its own: input and output share the context
+    /// window, so the most a request can receive is the window less its prompt.
+    const fn max_completion_tokens(self) -> usize {
+        self.config.context_window
+    }
+
+    /// Catalog fields shared by the public catalog and the OpenAI models list.
+    fn write_reasoning_metadata(self, value: &mut Value) {
+        value["max_completion_tokens"] = json!(self.max_completion_tokens());
+        if let Some(reasoning) = self.config.reasoning {
+            value["reasoning"] = reasoning.json();
+        }
+    }
+
+    fn catalog_json(self) -> Value {
+        let mut value = json!({
+            "id": self.id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "opensecret",
+            "provider": self.catalog_provider,
+            "provider_id": self.catalog_provider_id,
+            "display_name": self.display_name,
+            "short_name": self.short_name,
+            "description": self.description,
+            "context_window": self.config.context_window,
+            "max_context_tokens": self.config.context_window,
+            "access": self.access.as_str(),
+            "capabilities": self.capabilities.json(),
+            "tasks": self.tasks(),
+            "badges": self.badges,
+            "enabled": self.enabled,
+            "deprecated": self.deprecated,
+            "sort_order": self.sort_order,
+        });
+        self.write_reasoning_metadata(&mut value);
+
+        if let Some(metadata) = self.catalog_metadata {
+            value["input_modalities"] = json!(metadata.input_modalities);
+            value["output_modalities"] = json!(metadata.output_modalities);
+            if let Some(parameter_size) = metadata.parameter_size {
+                value["parameter_size"] = json!(parameter_size);
+            }
+            if let Some(active_parameter_size) = metadata.active_parameter_size {
+                value["active_parameter_size"] = json!(active_parameter_size);
+            }
+        }
+
+        value
+    }
+
+    fn openai_model_json(self) -> Value {
+        let mut value = json!({
+            "id": self.id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "opensecret",
+            "tasks": self.tasks(),
+            "display_name": self.display_name,
+            "short_name": self.short_name,
+            "context_window": self.config.context_window,
+            "max_context_tokens": self.config.context_window,
+            "access": self.access.as_str(),
+            "capabilities": self.capabilities.json(),
+            "badges": self.badges,
+        });
+        self.write_reasoning_metadata(&mut value);
+        value
+    }
+
+    fn tasks(self) -> Vec<&'static str> {
+        let mut tasks = vec!["generate"];
+        if self.capabilities.vision {
+            tasks.push("vision");
+        }
+        tasks
+    }
+}
+
+impl ModelCatalogMetadata {
+    const fn new(
+        input_modalities: &'static [&'static str],
+        output_modalities: &'static [&'static str],
+        parameter_size: Option<&'static str>,
+        active_parameter_size: Option<&'static str>,
+    ) -> Self {
+        Self {
+            input_modalities,
+            output_modalities,
+            parameter_size,
+            active_parameter_size,
+        }
+    }
+}
+
+impl ModelAccessTier {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Pro => "pro",
+        }
+    }
+
+    const fn is_available_to(self, plan: ModelPlan) -> bool {
+        matches!(self, Self::Free) || matches!(plan, ModelPlan::Paid)
+    }
+}
+
+impl ModelPlan {
+    pub(crate) const fn from_is_paid(is_paid: bool) -> Self {
+        if is_paid {
+            Self::Paid
+        } else {
+            Self::Free
+        }
+    }
+
+    pub(crate) const fn is_paid(self) -> bool {
+        matches!(self, Self::Paid)
+    }
+
+    pub(crate) fn allows_model(self, model: &str) -> bool {
+        let canonical = alias_target(model).unwrap_or(model);
+        if let Some(decision) = decision_model(canonical) {
+            return decision.access.is_available_to(self);
+        }
+        model_entry(canonical).is_none_or(|entry| entry.access.is_available_to(self))
+    }
+}
+
+impl ModelAliasTargets {
+    /// Fixed alias targets for the account plan. Resolving an alias does not
+    /// grant access to its target model.
+    pub(crate) const fn for_plan(plan: ModelPlan) -> Self {
+        match plan {
+            ModelPlan::Free => FREE_MODEL_ALIAS_TARGETS,
+            ModelPlan::Paid => PAID_MODEL_ALIAS_TARGETS,
+        }
+    }
+
+    pub(crate) fn resolve(self, model: &str) -> &str {
+        match model {
+            AUTO_QUICK_MODEL_ID => self.quick,
+            AUTO_POWERFUL_MODEL_ID => self.powerful,
+            _ => model,
+        }
+    }
+
+    fn target_for(self, alias: &str) -> Option<&'static str> {
+        match alias {
+            AUTO_QUICK_MODEL_ID => Some(self.quick),
+            AUTO_POWERFUL_MODEL_ID => Some(self.powerful),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ModelAliasTargets {
+    fn default() -> Self {
+        Self::for_plan(ModelPlan::Free)
+    }
+}
+
+impl ModelCapabilities {
+    const fn chat(reasoning: bool, vision: bool) -> Self {
+        Self {
+            chat: true,
+            vision,
+            reasoning,
+            tool_use: true,
+        }
+    }
+
+    const fn chat_with_tool_use(reasoning: bool, vision: bool, tool_use: bool) -> Self {
+        Self {
+            chat: true,
+            vision,
+            reasoning,
+            tool_use,
+        }
+    }
+
+    fn json(self) -> Value {
+        json!({
+            "chat": self.chat,
+            "vision": self.vision,
+            "reasoning": self.reasoning,
+            "tool_use": self.tool_use,
+        })
+    }
+}
+
+impl ModelAliasEntry {
+    fn catalog_json(self, plan: ModelPlan) -> Value {
+        let target_model = ModelAliasTargets::for_plan(plan)
+            .target_for(self.id)
+            .expect("catalog alias must have a configured target");
+        let target = model_entry(target_model);
+        let context_window = target
+            .map(|entry| entry.config.context_window)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        let mut value = json!({
+            "id": self.id,
+            "label": self.label,
+            "short_name": self.short_name,
+            "description": self.description,
+            "target_model": target_model,
+            "access": target.map(|entry| entry.access.as_str()).unwrap_or("free"),
+            "capabilities": target.map(|entry| entry.capabilities.json()).unwrap_or_else(|| ModelCapabilities::chat(false, false).json()),
+            "context_window": context_window,
+            "max_completion_tokens": context_window,
+        });
+        if let Some(reasoning) = alias_reasoning(self.id, plan) {
+            value["reasoning"] = reasoning.json();
+        }
+        value
+    }
+}
+
+const DEFAULT_MODEL_CONFIG: ModelConfig = ModelConfig {
+    context_window: DEFAULT_CONTEXT_WINDOW,
+    responses: UNCATALOGED_RESPONSES_MODEL_CONFIG,
+    reasoning: None,
+    developer_role_as_system: false,
+};
+
+// Reasoning controls each deployed build honors, verified live on both
+// providers on 2026-10-07 (issue #1087). Harmony (gpt-oss) rejects every other
+// value with a 400 and defaults to medium.
+const GPT_OSS_REASONING: ModelReasoning = ModelReasoning::tiers(
+    true,
+    ReasoningEffortSet::of(&[
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+    ]),
+    ReasoningEffort::Medium,
+);
+
+// Gemma 4 only has a thinking switch: `none` keeps it off, any other effort
+// turns it on, and the model itself defaults to off.
+const GEMMA4_REASONING: ModelReasoning = ModelReasoning::toggle(false);
+
+// Kimi K3's renderer accepts low/high/max, treats `none` as thinking off and
+// rejects everything else with a 400; it defaults to max.
+const KIMI_K3_REASONING: ModelReasoning = ModelReasoning::tiers(
+    false,
+    ReasoningEffortSet::of(&[
+        ReasoningEffort::Low,
+        ReasoningEffort::High,
+        ReasoningEffort::Max,
+    ]),
+    ReasoningEffort::Max,
+);
+
+// GLM-5.3 and GLM-5.3-Flash never reject a value: anything but low/high runs
+// at max, and every thinking-off control leaks the reasoning into `content`
+// on the deployed builds (vLLM fix d95d1dc is unreleased). Reasoning is
+// therefore mandatory and unsupported values must be caught here.
+const GLM_5_3_REASONING: ModelReasoning = ModelReasoning::tiers(
+    true,
+    ReasoningEffortSet::of(&[
+        ReasoningEffort::Low,
+        ReasoningEffort::High,
+        ReasoningEffort::Max,
+    ]),
+    ReasoningEffort::Max,
+);
+
+// DeepSeek V4.1 accepts low/high/xhigh/max, treats `none` as chat mode and
+// rejects minimal/medium with a 400; its template default is high.
+const DEEPSEEK_V4_1_FLASH_REASONING: ModelReasoning = ModelReasoning::tiers(
+    false,
+    ReasoningEffortSet::of(&[
+        ReasoningEffort::Low,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ]),
+    ReasoningEffort::High,
+);
+
+// Each catalog model uses its creator's published sampling and reasoning-history
+// rules. Change these only from a cited model card, generation config, or
+// official usage guide.
+
+// openai/gpt-oss README, "Recommended Sampling Parameters"; the harmony format
+// guide drops chain of thought from earlier turns but keeps it across tool calls.
+const GPT_OSS_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig::recommended(
+    SamplingConfig::new(1.0, 1.0),
+    ReasoningHistoryStrategy::CurrentTurn,
+);
+
+// google/gemma-4-31b-it model card, "Sampling Parameters" (all use cases) and
+// "Multi-Turn Conversations" (no thoughts from earlier turns, except tool calls).
+const GEMMA4_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig::recommended(
+    SamplingConfig::new(1.0, 0.95).with_top_k(64),
+    ReasoningHistoryStrategy::CurrentTurn,
+)
+.with_thinking_enabled();
+
+// zai-org/GLM-5.3 and GLM-5.3-Flash generation_config.json; both model cards say
+// to pass `clear_thinking=true` for chat.
+const GLM_5_3_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig::recommended(
+    SamplingConfig::new(1.0, 0.95),
+    ReasoningHistoryStrategy::GlmClearThinking,
+);
+
+// moonshotai/Kimi-K3 model card: temperature 1.0, top_p 0.95 for single-step
+// tasks and 1.0 for agentic ones; preserved thinking history is required.
+const KIMI_K3_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig::recommended(
+    SamplingConfig::new(1.0, 0.95).with_tool_use_top_p(1.0),
+    ReasoningHistoryStrategy::KimiPreserveThinking,
+);
+
+// deepseek-ai/DeepSeek-V4.1-Flash model card, "Recommended sampling parameters"
+// (top_p 0.95 or 1.0), and its encoding guide: reasoning is kept for every
+// turn when tools are present and dropped otherwise.
+const DEEPSEEK_V4_1_FLASH_RESPONSES_MODEL_CONFIG: ResponsesModelConfig =
+    ResponsesModelConfig::recommended(
+        SamplingConfig::new(1.0, 1.0),
+        ReasoningHistoryStrategy::DeepSeekToolsOnly,
+    );
+
+// meta-llama/Llama-3.3-70B-Instruct generation_config.json and the
+// meta-llama/llama-models generation defaults.
+const LLAMA3_3_70B_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig::recommended(
+    SamplingConfig::new(0.6, 0.9),
+    ReasoningHistoryStrategy::Omit,
+);
+
+const MODEL_CONFIGS: &[ModelConfigEntry] = &[
+    ModelConfigEntry::new(
+        "gpt-oss-120b",
+        "OpenAI GPT-OSS 120B",
+        "GPT-OSS",
+        "Fast, everyday reasoning model.",
+        ModelAccessTier::Free,
+        ModelCapabilities::chat(true, false),
+        &[],
+        true,
+        true,
+        false,
+        10,
+        131_072,
+        GPT_OSS_RESPONSES_MODEL_CONFIG,
+    )
+    .with_reasoning(GPT_OSS_REASONING),
+    ModelConfigEntry::new(
+        "gemma4-31b",
+        "Gemma 4 31B",
+        "Gemma 4",
+        "Efficient reasoning and vision model.",
+        ModelAccessTier::Pro,
+        ModelCapabilities::chat(true, true),
+        &[],
+        true,
+        true,
+        false,
+        20,
+        262_144,
+        GEMMA4_RESPONSES_MODEL_CONFIG,
+    )
+    .with_reasoning(GEMMA4_REASONING),
+    ModelConfigEntry::new(
+        GLM_5_3_FLASH_MODEL_ID,
+        "GLM-5.3 Flash",
+        "GLM-5.3 Flash",
+        "Fast multimodal reasoning and tool-use model.",
+        ModelAccessTier::Pro,
+        ModelCapabilities::chat(true, true),
+        &[],
+        true,
+        true,
+        false,
+        25,
+        // Both providers support 1,048,576 tokens; Privatemode v1.57.0 uses
+        // --max-model-len=1048576 for glm-5.3-flash.
+        1_048_576,
+        GLM_5_3_RESPONSES_MODEL_CONFIG,
+    )
+    .with_reasoning(GLM_5_3_REASONING)
+    .with_catalog_metadata(ModelCatalogMetadata::new(
+        &["text", "image"],
+        &["text"],
+        None,
+        None,
+    )),
+    ModelConfigEntry::new(
+        KIMI_K3_MODEL_ID,
+        "Kimi K3",
+        "Kimi K3",
+        "Multimodal reasoning and tool-use model.",
+        ModelAccessTier::Pro,
+        ModelCapabilities::chat(true, true),
+        &[],
+        true,
+        true,
+        false,
+        30,
+        262_144,
+        KIMI_K3_RESPONSES_MODEL_CONFIG,
+    )
+    .with_reasoning(KIMI_K3_REASONING)
+    .with_developer_role_as_system()
+    .with_catalog_metadata(ModelCatalogMetadata::new(
+        &["text", "image"],
+        &["text"],
+        Some("2.8T"),
+        Some("104B"),
+    )),
+    ModelConfigEntry::new(
+        GLM_5_3_MODEL_ID,
+        "GLM 5.3",
+        "GLM 5.3",
+        "Flagship reasoning model for complex engineering and long-horizon agent work.",
+        ModelAccessTier::Pro,
+        ModelCapabilities::chat(true, false),
+        &[],
+        true,
+        true,
+        false,
+        50,
+        // GLM 5.3 retains its configured window independently of Flash.
+        262_144,
+        GLM_5_3_RESPONSES_MODEL_CONFIG,
+    )
+    .with_reasoning(GLM_5_3_REASONING)
+    .with_catalog_provider("continuum", "glm-5.3")
+    .with_catalog_metadata(ModelCatalogMetadata::new(&["text"], &["text"], None, None)),
+    ModelConfigEntry::new(
+        DEEPSEEK_V4_1_FLASH_MODEL_ID,
+        "DeepSeek V4.1 Flash",
+        "DeepSeek V4.1 Flash",
+        "Long-context multimodal reasoning and tool-use model.",
+        ModelAccessTier::Pro,
+        ModelCapabilities::chat(true, true),
+        &["New"],
+        true,
+        true,
+        false,
+        65,
+        1_048_576,
+        DEEPSEEK_V4_1_FLASH_RESPONSES_MODEL_CONFIG,
+    )
+    .with_reasoning(DEEPSEEK_V4_1_FLASH_REASONING)
+    .with_catalog_metadata(ModelCatalogMetadata::new(
+        &["text", "image"],
+        &["text"],
+        Some("552B"),
+        Some("16B"),
+    )),
+    // Dealign's pinned 1017 derivative retains the base architecture, tokenizer,
+    // recommended sampling and reasoning protocol. Model card and revision:
+    // https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tree/c19ca5ca4eaeb79d29fdf08aea8327da95b1116a
+    ModelConfigEntry::new(
+        DEEPSEEK_V4_1_FLASH_UNCENSORED_MODEL_ID,
+        "DeepSeek V4.1 Flash Uncensored",
+        "DeepSeek Uncensored",
+        "Dealign's uncensored DeepSeek 1017 reasoning and tool-use model.",
+        ModelAccessTier::Pro,
+        ModelCapabilities::chat(true, true),
+        &["Beta"],
+        true,
+        true,
+        false,
+        66,
+        1_048_576,
+        DEEPSEEK_V4_1_FLASH_RESPONSES_MODEL_CONFIG,
+    )
+    .with_reasoning(DEEPSEEK_V4_1_FLASH_REASONING)
+    .with_catalog_provider("maple", DEEPSEEK_V4_1_FLASH_UNCENSORED_MODEL_ID)
+    .with_catalog_metadata(ModelCatalogMetadata::new(
+        &["text", "image"],
+        &["text"],
+        Some("552B"),
+        Some("16B"),
+    )),
+    ModelConfigEntry::new(
+        "llama3-3-70b",
+        "Llama 3.3 70B",
+        "Llama 3.3",
+        "General-purpose model.",
+        ModelAccessTier::Free,
+        ModelCapabilities::chat(false, false),
+        &[],
+        true,
+        true,
+        false,
+        80,
+        131_072,
+        LLAMA3_3_70B_RESPONSES_MODEL_CONFIG,
+    ),
+    ModelConfigEntry::api_only(
+        "gpt-oss-safeguard-120b",
+        "OpenAI GPT-OSS Safeguard 120B",
+        "GPT-OSS Safeguard",
+        "Safety model available through the API.",
+        ModelAccessTier::Free,
+        ModelCapabilities::chat_with_tool_use(true, false, false),
+        &["Safety"],
+        true,
+        false,
+        900,
+        131_072,
+        GPT_OSS_RESPONSES_MODEL_CONFIG,
+    )
+    .with_reasoning(GPT_OSS_REASONING),
+];
+
+const MODEL_ALIAS_ENTRIES: &[ModelAliasEntry] = &[
+    ModelAliasEntry {
+        id: AUTO_QUICK_MODEL_ID,
+        label: "Quick",
+        short_name: "Quick",
+        description: "Fast, everyday responses",
+    },
+    ModelAliasEntry {
+        id: AUTO_POWERFUL_MODEL_ID,
+        label: "Powerful",
+        short_name: "Powerful",
+        description: "Deeper thinking & analysis",
+    },
+];
+
+fn alias_target(model: &str) -> Option<&'static str> {
+    ModelAliasTargets::default().target_for(model)
+}
+
+fn model_entry(model: &str) -> Option<ModelConfigEntry> {
+    MODEL_CONFIGS
+        .iter()
+        .find(|entry| entry.id == model)
+        .copied()
+}
+
+/// Catalog capabilities of a canonical public model, if it exists.
+pub(crate) fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
+    model_entry(alias_target(model).unwrap_or(model)).map(|entry| entry.capabilities)
+}
+
+#[cfg(test)]
+pub(crate) fn enabled_api_completion_model_ids() -> impl Iterator<Item = &'static str> {
+    MODEL_CONFIGS
+        .iter()
+        .filter(|entry| entry.api_listed && entry.enabled && entry.capabilities.chat)
+        .map(|entry| entry.id)
+}
+
+/// Public model identity is independent of provider rollout. Maple eligibility
+/// is checked by routing, alongside the other routes for the same public model.
+pub fn resolve_public_model_id(model: &str) -> Option<&'static str> {
+    let canonical = alias_target(model).unwrap_or(model);
+    MODEL_CONFIGS
+        .iter()
+        .find(|entry| entry.id == canonical && entry.api_listed && entry.enabled)
+        .map(|entry| entry.id)
+}
+
+pub fn model_config(model: &str) -> ModelConfig {
+    let canonical = alias_target(model).unwrap_or(model);
+
+    MODEL_CONFIGS
+        .iter()
+        .find(|entry| entry.id == canonical)
+        .or_else(|| {
+            MODEL_CONFIGS
+                .iter()
+                .find(|entry| canonical.starts_with(entry.id))
+        })
+        .map(|entry| entry.config)
+        .unwrap_or(DEFAULT_MODEL_CONFIG)
+}
+
+pub fn model_context_window(model: &str) -> usize {
+    model_config(model).context_window
+}
+
+pub fn model_reasoning_history_strategy(model: &str) -> ReasoningHistoryStrategy {
+    model_config(model).responses.reasoning_history
+}
+
+/// The prior reasoning to replay for one model turn.
+pub fn model_reasoning_replay(model: &str, tools_enabled: bool) -> ReasoningReplay {
+    model_reasoning_history_strategy(model).replay(tools_enabled)
+}
+
+/// The reasoning controls of a canonical public model, if it reasons.
+pub fn model_reasoning(model: &str) -> Option<ModelReasoning> {
+    model_entry(model).and_then(|entry| entry.config.reasoning)
+}
+
+/// The reasoning an alias publishes: what every model it may resolve to for the
+/// plan accepts (its target first, then its Auto alternates). `None` when any
+/// candidate never reasons.
+pub(crate) fn alias_reasoning(alias: &str, plan: ModelPlan) -> Option<ModelReasoning> {
+    let mut candidates =
+        auto_model_candidates(ModelSelectionMode::from_requested_model(alias), plan)?.into_iter();
+    let mut reasoning = model_reasoning(candidates.next()?)?;
+    for candidate in candidates {
+        reasoning = reasoning.intersect(model_reasoning(candidate)?);
+    }
+    Some(reasoning)
+}
+
+/// Listed models remain discoverable on every plan. Their access metadata and
+/// completion authorization enforce the existing Free/Pro boundary.
+pub(crate) fn model_catalog_response(plan: ModelPlan) -> Value {
+    let data = MODEL_CONFIGS
+        .iter()
+        .filter(|entry| entry.listed)
+        .map(|entry| entry.catalog_json())
+        .collect::<Vec<_>>();
+    let aliases = MODEL_ALIAS_ENTRIES
+        .iter()
+        .map(|entry| entry.catalog_json(plan))
+        .collect::<Vec<_>>();
+
+    json!({
+        "object": "list",
+        "data": data,
+        "aliases": aliases,
+        "defaults": {
+            "quick": AUTO_QUICK_MODEL_ID,
+            "powerful": AUTO_POWERFUL_MODEL_ID
+        },
+        "audio": {
+            "transcription": {
+                "available": true,
+                "model": "whisper-large-v3",
+                "display_name": "Whisper Large v3"
+            },
+            "speech": {
+                "available": true,
+                "model": "voxtral-tts",
+                "display_name": "Voxtral TTS"
+            }
+        }
+    })
+}
+
+/// The OpenAI-compatible catalog has the same provider-independent model
+/// identity and listing behavior as Research.
+pub fn openai_models_response() -> Value {
+    let mut data = MODEL_CONFIGS
+        .iter()
+        .filter(|entry| entry.api_listed && entry.enabled)
+        .map(|entry| entry.openai_model_json())
+        .collect::<Vec<_>>();
+
+    data.extend([
+        json!({
+            "id": "whisper-large-v3",
+            "object": "model",
+            "created": 0,
+            "owned_by": "opensecret",
+            "tasks": ["transcribe"],
+            "display_name": "Whisper Large v3",
+            "short_name": "Whisper",
+        }),
+        json!({
+            "id": "voxtral-small-24b",
+            "object": "model",
+            "created": 0,
+            "owned_by": "opensecret",
+            "tasks": ["transcribe"],
+            "display_name": "Voxtral Small 24B",
+            "short_name": "Voxtral Small",
+        }),
+        json!({
+            "id": "nomic-embed-text",
+            "object": "model",
+            "created": 0,
+            "owned_by": "opensecret",
+            "tasks": ["embed"],
+            "display_name": "Nomic Embed Text",
+            "short_name": "Nomic Embed",
+        }),
+        json!({
+            "id": "voxtral-tts",
+            "object": "model",
+            "created": 0,
+            "owned_by": "opensecret",
+            "tasks": ["speech"],
+            "display_name": "Voxtral TTS",
+            "short_name": "Voxtral TTS",
+        }),
+    ]);
+
+    json!({
+        "object": "list",
+        "data": data,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uncensored_catalog_is_visible_on_every_plan_with_pro_access() {
+        let id = DEEPSEEK_V4_1_FLASH_UNCENSORED_MODEL_ID;
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let catalog = model_catalog_response(plan);
+            let derivative = catalog_model(&catalog, id);
+            assert_eq!(derivative["provider"], "maple");
+            assert_eq!(derivative["provider_id"], id);
+            assert_eq!(derivative["context_window"], 1_048_576);
+            assert_eq!(derivative["access"], "pro");
+            assert_eq!(derivative["badges"], json!(["Beta"]));
+            assert_eq!(catalog["defaults"]["quick"], AUTO_QUICK_MODEL_ID);
+            assert_eq!(catalog["defaults"]["powerful"], AUTO_POWERFUL_MODEL_ID);
+            assert!(has_model(&catalog, DEEPSEEK_V4_1_FLASH_MODEL_ID));
+        }
+
+        let models = openai_models_response();
+        assert_eq!(catalog_model(&models, id)["access"], "pro");
+        assert!(has_model(&models, DEEPSEEK_V4_1_FLASH_MODEL_ID));
+        assert_eq!(resolve_public_model_id(id), Some(id));
+        assert!(!ModelPlan::Free.allows_model(id));
+        assert!(ModelPlan::Paid.allows_model(id));
+    }
+
+    fn has_model(response: &Value, model_id: &str) -> bool {
+        response["data"]
+            .as_array()
+            .expect("model list data")
+            .iter()
+            .any(|model| model["id"] == model_id)
+    }
+
+    fn catalog_model<'a>(response: &'a Value, model_id: &str) -> &'a Value {
+        response["data"]
+            .as_array()
+            .expect("catalog data")
+            .iter()
+            .find(|model| model["id"] == model_id)
+            .expect("model in catalog")
+    }
+
+    fn model_ids_with_badge(response: &Value, badge: &str) -> Vec<String> {
+        let mut model_ids = response["data"]
+            .as_array()
+            .expect("model list data")
+            .iter()
+            .filter(|model| {
+                model["badges"]
+                    .as_array()
+                    .is_some_and(|badges| badges.iter().any(|value| value == badge))
+            })
+            .filter_map(|model| model["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        model_ids.sort_unstable();
+        model_ids
+    }
+
+    #[test]
+    fn test_model_context_window_known_models() {
+        assert_eq!(model_context_window("llama3-3-70b"), 131_072);
+        assert_eq!(model_context_window("gpt-oss-120b"), 131_072);
+        assert_eq!(model_context_window("gpt-oss-safeguard-120b"), 131_072);
+        assert_eq!(model_context_window("gemma4-31b"), 262_144);
+        assert_eq!(model_context_window("glm-5-3"), 262_144);
+        assert_eq!(model_context_window("glm-5-3-flash"), 1_048_576);
+        assert_eq!(model_context_window("kimi-k3"), 262_144);
+        assert_eq!(model_context_window("deepseek-v4-1-flash"), 1_048_576);
+        assert_eq!(model_context_window(AUTO_QUICK_MODEL_ID), 131_072);
+        assert_eq!(model_context_window(AUTO_POWERFUL_MODEL_ID), 262_144);
+    }
+
+    #[test]
+    fn test_every_catalog_model_uses_its_creators_sampling() {
+        let expected = [
+            ("gpt-oss-120b", 1.0, 1.0, None, None),
+            ("gpt-oss-safeguard-120b", 1.0, 1.0, None, None),
+            ("gemma4-31b", 1.0, 0.95, None, Some(64)),
+            ("glm-5-3", 1.0, 0.95, None, None),
+            ("glm-5-3-flash", 1.0, 0.95, None, None),
+            ("kimi-k3", 1.0, 0.95, Some(1.0), None),
+            ("deepseek-v4-1-flash", 1.0, 1.0, None, None),
+            (
+                DEEPSEEK_V4_1_FLASH_UNCENSORED_MODEL_ID,
+                1.0,
+                1.0,
+                None,
+                None,
+            ),
+            ("llama3-3-70b", 0.6, 0.9, None, None),
+        ];
+        assert_eq!(expected.len(), MODEL_CONFIGS.len());
+
+        for (model, temperature, top_p, tool_use_top_p, top_k) in expected {
+            let sampling = model_config(model)
+                .responses
+                .sampling
+                .unwrap_or_else(|| panic!("{model} must declare recommended sampling"));
+            assert_eq!(
+                sampling,
+                SamplingConfig {
+                    temperature,
+                    top_p,
+                    tool_use_top_p,
+                    top_k,
+                },
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_uncataloged_models_omit_sampling_and_reasoning_history() {
+        let responses = model_config("unknown-model").responses;
+
+        assert_eq!(responses.sampling, None);
+        assert_eq!(responses.reasoning_history, ReasoningHistoryStrategy::Omit);
+    }
+
+    #[test]
+    fn test_gemma4_responses_config_enables_thinking() {
+        let responses_config = model_config("gemma4-31b").responses;
+
+        assert!(responses_config.include_reasoning);
+        assert!(responses_config.enable_thinking);
+    }
+
+    #[test]
+    fn test_model_reasoning_history_strategy_follows_each_creator() {
+        for (model, strategy) in [
+            ("gpt-oss-120b", ReasoningHistoryStrategy::CurrentTurn),
+            (
+                "gpt-oss-safeguard-120b",
+                ReasoningHistoryStrategy::CurrentTurn,
+            ),
+            ("gemma4-31b", ReasoningHistoryStrategy::CurrentTurn),
+            ("glm-5-3", ReasoningHistoryStrategy::GlmClearThinking),
+            ("glm-5-3-flash", ReasoningHistoryStrategy::GlmClearThinking),
+            ("kimi-k3", ReasoningHistoryStrategy::KimiPreserveThinking),
+            (
+                "deepseek-v4-1-flash",
+                ReasoningHistoryStrategy::DeepSeekToolsOnly,
+            ),
+            ("llama3-3-70b", ReasoningHistoryStrategy::Omit),
+            (
+                AUTO_POWERFUL_MODEL_ID,
+                ReasoningHistoryStrategy::GlmClearThinking,
+            ),
+            ("unknown-model", ReasoningHistoryStrategy::Omit),
+        ] {
+            assert_eq!(model_reasoning_history_strategy(model), strategy, "{model}");
+        }
+    }
+
+    #[test]
+    fn test_reasoning_replay_depends_on_tools_only_for_deepseek() {
+        use ReasoningReplay::{All, CurrentTurn, None};
+
+        for (model, without_tools, with_tools) in [
+            ("gpt-oss-120b", CurrentTurn, CurrentTurn),
+            ("gemma4-31b", CurrentTurn, CurrentTurn),
+            ("glm-5-3", CurrentTurn, CurrentTurn),
+            ("glm-5-3-flash", CurrentTurn, CurrentTurn),
+            ("kimi-k3", All, All),
+            ("deepseek-v4-1-flash", None, All),
+            ("llama3-3-70b", None, None),
+        ] {
+            assert_eq!(
+                model_reasoning_replay(model, false),
+                without_tools,
+                "{model}"
+            );
+            assert_eq!(model_reasoning_replay(model, true), with_tools, "{model}");
+        }
+        assert_eq!(CurrentTurn.before_new_user_message(), None);
+        assert_eq!(All.before_new_user_message(), All);
+    }
+
+    #[test]
+    fn test_reasoning_history_chat_template_kwargs() {
+        assert_eq!(
+            ReasoningHistoryStrategy::GlmClearThinking.chat_template_kwarg(),
+            Some(("clear_thinking", json!(true)))
+        );
+        assert_eq!(
+            ReasoningHistoryStrategy::KimiPreserveThinking.chat_template_kwarg(),
+            Some(("preserve_thinking", json!(true)))
+        );
+        for strategy in [
+            ReasoningHistoryStrategy::Omit,
+            ReasoningHistoryStrategy::CurrentTurn,
+            ReasoningHistoryStrategy::DeepSeekToolsOnly,
+        ] {
+            assert_eq!(strategy.chat_template_kwarg(), None);
+        }
+    }
+
+    #[test]
+    fn test_sampling_config_applies_overrides() {
+        let kimi = model_config("kimi-k3").responses.sampling.unwrap();
+
+        let temperature_only = kimi.with_overrides(Some(0.5), None);
+        assert_eq!(temperature_only.temperature, 0.5);
+        assert_eq!(temperature_only.top_p_for(false), 0.95);
+        assert_eq!(temperature_only.top_p_for(true), 1.0);
+
+        // An explicit caller top_p applies to every turn.
+        let top_p = kimi.with_overrides(None, Some(0.8));
+        assert_eq!(top_p.top_p_for(false), 0.8);
+        assert_eq!(top_p.top_p_for(true), 0.8);
+    }
+
+    #[test]
+    fn test_model_context_window_unknown_models() {
+        assert_eq!(model_context_window("gpt-4"), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(model_context_window("claude-3"), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(
+            model_context_window("unknown-model-xyz"),
+            DEFAULT_CONTEXT_WINDOW
+        );
+        assert_eq!(model_context_window(""), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn test_model_config_prefix_matching() {
+        assert_eq!(model_context_window("llama3-3-70b-instruct"), 131_072);
+        assert_eq!(
+            model_context_window("unknown-r1-70b-instruct"),
+            DEFAULT_CONTEXT_WINDOW
+        );
+    }
+
+    #[test]
+    fn test_resolve_public_model_aliases() {
+        assert_eq!(
+            resolve_public_model_id(AUTO_QUICK_MODEL_ID),
+            Some(QUICK_MODEL_ID)
+        );
+        assert_eq!(
+            resolve_public_model_id(AUTO_POWERFUL_MODEL_ID),
+            Some(POWERFUL_MODEL_ID)
+        );
+        assert_eq!(
+            resolve_public_model_id("gpt-oss-safeguard-120b"),
+            Some("gpt-oss-safeguard-120b")
+        );
+        assert_eq!(resolve_public_model_id("voxtral-small-24b"), None);
+        assert_eq!(resolve_public_model_id("quick"), None);
+        assert_eq!(resolve_public_model_id("kimi-k2-5"), None);
+        assert_eq!(resolve_public_model_id("kimi-k2-6"), None);
+        assert_eq!(resolve_public_model_id("kimi-k3"), Some("kimi-k3"));
+        assert_eq!(resolve_public_model_id("glm-5-3"), Some("glm-5-3"));
+        assert_eq!(
+            resolve_public_model_id("glm-5-3-flash"),
+            Some("glm-5-3-flash")
+        );
+        assert_eq!(resolve_public_model_id("deepseek-v4-flash"), None);
+        assert_eq!(
+            resolve_public_model_id("deepseek-v4-1-flash"),
+            Some("deepseek-v4-1-flash")
+        );
+        assert_eq!(resolve_public_model_id("unknown-model"), None);
+    }
+
+    #[test]
+    fn test_model_alias_targets_are_selected_by_plan() {
+        assert_eq!(POWERFUL_MODEL_ID, GLM_5_3_MODEL_ID);
+
+        let free = ModelAliasTargets::for_plan(ModelPlan::Free);
+        assert_eq!(free.resolve(AUTO_QUICK_MODEL_ID), QUICK_MODEL_ID);
+        assert_eq!(free.resolve(AUTO_POWERFUL_MODEL_ID), GLM_5_3_MODEL_ID);
+
+        let paid = ModelAliasTargets::for_plan(ModelPlan::Paid);
+        assert_eq!(paid.resolve(AUTO_QUICK_MODEL_ID), GLM_5_3_FLASH_MODEL_ID);
+        assert_eq!(paid.resolve(AUTO_POWERFUL_MODEL_ID), GLM_5_3_MODEL_ID);
+        assert_eq!(paid.resolve(KIMI_K3_MODEL_ID), KIMI_K3_MODEL_ID);
+    }
+
+    #[test]
+    fn test_auto_targets_use_glm_5_3_and_preserve_plan_specific_quick() {
+        for (plan, expected_quick) in [
+            (ModelPlan::Free, QUICK_MODEL_ID),
+            (ModelPlan::Paid, GLM_5_3_FLASH_MODEL_ID),
+        ] {
+            let targets = ModelAliasTargets::for_plan(plan);
+            assert_eq!(targets.resolve(AUTO_QUICK_MODEL_ID), expected_quick);
+            assert_eq!(targets.resolve(AUTO_POWERFUL_MODEL_ID), GLM_5_3_MODEL_ID);
+            assert_eq!(
+                resolve_public_model_id(targets.resolve(AUTO_POWERFUL_MODEL_ID)),
+                Some(GLM_5_3_MODEL_ID)
+            );
+            assert_eq!(
+                model_context_window(targets.resolve(AUTO_POWERFUL_MODEL_ID)),
+                model_context_window(GLM_5_3_MODEL_ID)
+            );
+        }
+    }
+
+    #[test]
+    fn test_alias_policy_preserves_explicit_model_identities() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let targets = ModelAliasTargets::for_plan(plan);
+            for model in enabled_api_completion_model_ids() {
+                assert_eq!(targets.resolve(model), model, "plan={plan:?}");
+                assert_eq!(resolve_public_model_id(targets.resolve(model)), Some(model));
+            }
+            assert_eq!(targets.resolve(GLM_5_3_MODEL_ID), GLM_5_3_MODEL_ID);
+            assert_eq!(targets.resolve("unknown-model"), "unknown-model");
+            assert_eq!(
+                resolve_public_model_id(targets.resolve("unknown-model")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_catalog_alias_metadata_matches_resolved_models() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let targets = ModelAliasTargets::for_plan(plan);
+            let catalog = model_catalog_response(plan);
+            for alias in catalog["aliases"].as_array().expect("aliases") {
+                let selector = alias["id"].as_str().expect("alias ID");
+                let target = targets.resolve(selector);
+                let model = catalog_model(&catalog, target);
+                assert_eq!(alias["target_model"], target);
+                assert_eq!(alias["access"], model["access"]);
+                assert_eq!(alias["capabilities"], model["capabilities"]);
+            }
+            assert_eq!(catalog["defaults"]["quick"], AUTO_QUICK_MODEL_ID);
+            assert_eq!(catalog["defaults"]["powerful"], AUTO_POWERFUL_MODEL_ID);
+            assert!(!has_model(&catalog, "glm-5-2"));
+            assert!(!has_model(&catalog, "deepseek-v4-flash"));
+            assert!(has_model(&catalog, GLM_5_3_MODEL_ID));
+        }
+    }
+
+    #[test]
+    fn test_auto_targets_preserve_model_entitlements() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let targets = ModelAliasTargets::for_plan(plan);
+            assert!(plan.allows_model(targets.resolve(AUTO_QUICK_MODEL_ID)));
+            assert_eq!(
+                plan.allows_model(targets.resolve(AUTO_POWERFUL_MODEL_ID)),
+                plan.is_paid()
+            );
+            for model in [GLM_5_3_MODEL_ID, GLM_5_3_FLASH_MODEL_ID] {
+                assert_eq!(plan.allows_model(targets.resolve(model)), plan.is_paid());
+            }
+        }
+    }
+
+    #[test]
+    fn test_golden_auto_alias_resolution_matrix_by_plan() {
+        for (plan, selector, expected_target) in [
+            (ModelPlan::Free, AUTO_QUICK_MODEL_ID, QUICK_MODEL_ID),
+            (ModelPlan::Paid, AUTO_QUICK_MODEL_ID, GLM_5_3_FLASH_MODEL_ID),
+            (ModelPlan::Free, AUTO_POWERFUL_MODEL_ID, GLM_5_3_MODEL_ID),
+            (ModelPlan::Paid, AUTO_POWERFUL_MODEL_ID, GLM_5_3_MODEL_ID),
+        ] {
+            let targets = ModelAliasTargets::for_plan(plan);
+            assert_eq!(targets.resolve(selector), expected_target, "plan={plan:?}");
+        }
+    }
+
+    #[test]
+    fn test_golden_explicit_model_resolution_is_plan_invariant() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let targets = ModelAliasTargets::for_plan(plan);
+            for model in [
+                QUICK_MODEL_ID,
+                KIMI_K3_MODEL_ID,
+                GLM_5_3_MODEL_ID,
+                GLM_5_3_FLASH_MODEL_ID,
+                DEEPSEEK_V4_1_FLASH_MODEL_ID,
+            ] {
+                assert_eq!(
+                    targets.resolve(model),
+                    model,
+                    "explicit model changed for plan={plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_catalog_alias_metadata_tracks_paid_targets() {
+        let catalog = model_catalog_response(ModelPlan::Paid);
+        let aliases = catalog["aliases"].as_array().expect("aliases");
+        let quick = aliases
+            .iter()
+            .find(|alias| alias["id"] == AUTO_QUICK_MODEL_ID)
+            .expect("quick alias");
+        let powerful = aliases
+            .iter()
+            .find(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID)
+            .expect("powerful alias");
+
+        assert_eq!(quick["target_model"], GLM_5_3_FLASH_MODEL_ID);
+        assert_eq!(quick["access"], "pro");
+        assert_eq!(quick["capabilities"]["vision"], true);
+        assert_eq!(powerful["target_model"], GLM_5_3_MODEL_ID);
+        assert_eq!(powerful["access"], "pro");
+        assert_eq!(powerful["capabilities"]["vision"], false);
+    }
+
+    #[test]
+    fn test_model_plan_enforces_catalog_access_tiers_and_alias_targets() {
+        for model in [
+            "gpt-oss-120b",
+            "gpt-oss-safeguard-120b",
+            "llama3-3-70b",
+            AUTO_QUICK_MODEL_ID,
+            "unknown-model",
+        ] {
+            assert!(ModelPlan::Free.allows_model(model), "free model: {model}");
+            assert!(ModelPlan::Paid.allows_model(model), "paid model: {model}");
+        }
+
+        for model in [
+            "gemma4-31b",
+            "kimi-k3",
+            "glm-5-3",
+            "glm-5-3-flash",
+            "deepseek-v4-1-flash",
+            AUTO_POWERFUL_MODEL_ID,
+        ] {
+            assert!(
+                !ModelPlan::Free.allows_model(model),
+                "free plan should deny: {model}"
+            );
+            assert!(ModelPlan::Paid.allows_model(model), "paid model: {model}");
+        }
+    }
+
+    #[test]
+    fn decision_models_are_pro_and_never_chat_models() {
+        let ids: Vec<&str> = decision_models().iter().map(|model| model.id).collect();
+        assert_eq!(
+            ids,
+            [
+                DECISION_SMALL_MODEL_ID,
+                DECISION_MEDIUM_MODEL_ID,
+                DECISION_LARGE_MODEL_ID
+            ]
+        );
+        let catalog = model_catalog_response(ModelPlan::Paid);
+        let openai = openai_models_response();
+        for model in decision_models() {
+            assert_eq!(decision_model(model.id), Some(*model));
+            assert!(!ModelPlan::Free.allows_model(model.id), "{}", model.id);
+            assert!(ModelPlan::Paid.allows_model(model.id), "{}", model.id);
+            assert_eq!(model.context_window, 32_768);
+            assert_eq!(model.max_choice_options, 26);
+            // Not a completion model: chat and Responses cannot resolve it, and neither
+            // catalog lists it.
+            assert_eq!(resolve_public_model_id(model.id), None);
+            assert!(model_capabilities(model.id).is_none());
+            assert!(!has_model(&catalog, model.id));
+            assert!(!has_model(&openai, model.id));
+        }
+        assert_eq!(decision_model(GLM_5_3_FLASH_MODEL_ID), None);
+    }
+
+    #[test]
+    fn test_catalog_hides_api_only_models_and_includes_aliases() {
+        let response = model_catalog_response(ModelPlan::Free);
+        let data = response["data"].as_array().expect("catalog data");
+        assert!(data.iter().any(|model| model["id"] == QUICK_MODEL_ID));
+        assert!(!data
+            .iter()
+            .any(|model| model["id"] == "gpt-oss-safeguard-120b"));
+        assert!(!data.iter().any(|model| model["id"] == "voxtral-small-24b"));
+
+        let aliases = response["aliases"].as_array().expect("aliases");
+        assert!(aliases
+            .iter()
+            .any(|alias| alias["id"] == AUTO_QUICK_MODEL_ID));
+        assert!(aliases
+            .iter()
+            .any(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID));
+
+        for (plan, expected_quick, expected_quick_access) in [
+            (ModelPlan::Free, QUICK_MODEL_ID, "free"),
+            (ModelPlan::Paid, GLM_5_3_FLASH_MODEL_ID, "pro"),
+        ] {
+            let catalog = model_catalog_response(plan);
+            let aliases = catalog["aliases"].as_array().expect("aliases");
+            let quick = aliases
+                .iter()
+                .find(|alias| alias["id"] == AUTO_QUICK_MODEL_ID)
+                .expect("quick alias");
+            let powerful = aliases
+                .iter()
+                .find(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID)
+                .expect("powerful alias");
+
+            assert_eq!(quick["target_model"], expected_quick);
+            assert_eq!(quick["access"], expected_quick_access);
+            assert_eq!(powerful["target_model"], POWERFUL_MODEL_ID);
+            assert_eq!(powerful["access"], "pro");
+        }
+    }
+
+    #[test]
+    fn test_openai_models_includes_api_only_models() {
+        let response = openai_models_response();
+        let data = response["data"].as_array().expect("models data");
+
+        assert!(data
+            .iter()
+            .any(|model| model["id"] == "gpt-oss-safeguard-120b"));
+        assert!(data.iter().any(|model| model["id"] == "voxtral-small-24b"));
+        assert!(!data.iter().any(|model| model["id"] == "qwen3-tts"));
+        assert!(data.iter().any(|model| model["id"] == "voxtral-tts"));
+    }
+
+    #[test]
+    fn test_catalog_advertises_voxtral_as_default_speech_model() {
+        let response = model_catalog_response(ModelPlan::Free);
+
+        assert_eq!(response["audio"]["speech"]["available"], true);
+        assert_eq!(response["audio"]["speech"]["model"], "voxtral-tts");
+        assert_eq!(response["audio"]["speech"]["display_name"], "Voxtral TTS");
+    }
+
+    #[test]
+    fn test_catalog_removes_deprecated_kimi_k2_6() {
+        let catalog = model_catalog_response(ModelPlan::Free);
+        let openai_models = openai_models_response();
+
+        assert!(!has_model(&catalog, "kimi-k2-6"));
+        assert!(!has_model(&openai_models, "kimi-k2-6"));
+        assert_eq!(resolve_public_model_id("kimi-k2-6"), None);
+    }
+
+    #[test]
+    fn test_catalog_adds_glm_5_3_directly_through_continuum_without_changing_aliases() {
+        let catalog = model_catalog_response(ModelPlan::Paid);
+        let glm = catalog_model(&catalog, GLM_5_3_MODEL_ID);
+
+        assert_eq!(glm["provider"], "continuum");
+        assert_eq!(glm["provider_id"], "glm-5.3");
+        assert_eq!(glm["access"], "pro");
+        assert_eq!(glm["context_window"], 262_144);
+        assert_eq!(glm["input_modalities"], json!(["text"]));
+        assert_eq!(glm["output_modalities"], json!(["text"]));
+        assert_eq!(glm["capabilities"]["vision"], false);
+        assert_eq!(glm["capabilities"]["reasoning"], true);
+        assert_eq!(glm["capabilities"]["tool_use"], true);
+
+        let powerful = catalog["aliases"]
+            .as_array()
+            .expect("aliases")
+            .iter()
+            .find(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID)
+            .expect("powerful alias");
+        assert_eq!(powerful["target_model"], GLM_5_3_MODEL_ID);
+    }
+
+    #[test]
+    fn test_catalog_adds_glm_5_3_flash_through_tinfoil_with_image_and_shared_1m_context() {
+        let catalog = model_catalog_response(ModelPlan::Paid);
+        let glm = catalog_model(&catalog, GLM_5_3_FLASH_MODEL_ID);
+
+        assert_eq!(glm["provider"], "tinfoil");
+        assert_eq!(glm["provider_id"], GLM_5_3_FLASH_MODEL_ID);
+        assert_eq!(glm["display_name"], "GLM-5.3 Flash");
+        assert_eq!(glm["access"], "pro");
+        assert_eq!(glm["context_window"], 1_048_576);
+        assert_eq!(glm["max_context_tokens"], 1_048_576);
+        assert_eq!(glm["input_modalities"], json!(["text", "image"]));
+        assert_eq!(glm["output_modalities"], json!(["text"]));
+        assert_eq!(glm["capabilities"]["vision"], true);
+        assert_eq!(glm["capabilities"]["reasoning"], true);
+        assert_eq!(glm["capabilities"]["tool_use"], true);
+        assert_eq!(glm["tasks"], json!(["generate", "vision"]));
+    }
+
+    #[test]
+    fn test_catalog_adds_deepseek_v4_1_flash_through_tinfoil_with_image_and_1m_context() {
+        let catalog = model_catalog_response(ModelPlan::Paid);
+        let deepseek = catalog_model(&catalog, DEEPSEEK_V4_1_FLASH_MODEL_ID);
+
+        assert_eq!(deepseek["provider"], "tinfoil");
+        assert_eq!(deepseek["provider_id"], DEEPSEEK_V4_1_FLASH_MODEL_ID);
+        assert_eq!(deepseek["display_name"], "DeepSeek V4.1 Flash");
+        assert_eq!(deepseek["access"], "pro");
+        assert_eq!(deepseek["context_window"], 1_048_576);
+        assert_eq!(deepseek["input_modalities"], json!(["text", "image"]));
+        assert_eq!(deepseek["output_modalities"], json!(["text"]));
+        assert_eq!(deepseek["capabilities"]["vision"], true);
+        assert_eq!(deepseek["capabilities"]["reasoning"], true);
+        assert_eq!(deepseek["capabilities"]["tool_use"], true);
+        assert_eq!(deepseek["tasks"], json!(["generate", "vision"]));
+        assert!(!has_model(&catalog, "deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn test_new_tinfoil_models_are_generally_listed() {
+        let catalog = model_catalog_response(ModelPlan::Free);
+        let openai_models = openai_models_response();
+
+        for model in [
+            "kimi-k3",
+            "deepseek-v4-1-flash",
+            GLM_5_3_FLASH_MODEL_ID,
+            QUICK_MODEL_ID,
+        ] {
+            assert!(has_model(&catalog, model));
+            assert!(has_model(&openai_models, model));
+        }
+    }
+
+    #[test]
+    fn test_new_badges_match_the_currently_launched_models() {
+        let expected = vec![DEEPSEEK_V4_1_FLASH_MODEL_ID.to_string()];
+
+        assert_eq!(
+            model_ids_with_badge(&model_catalog_response(ModelPlan::Free), "New"),
+            expected
+        );
+        assert_eq!(
+            model_ids_with_badge(&openai_models_response(), "New"),
+            expected
+        );
+        assert!(
+            model_ids_with_badge(&model_catalog_response(ModelPlan::Free), "Reasoning").is_empty()
+        );
+        assert!(model_ids_with_badge(&openai_models_response(), "Reasoning").is_empty());
+    }
+
+    #[test]
+    fn test_enriched_catalog_has_verified_new_model_metadata() {
+        let catalog = model_catalog_response(ModelPlan::Free);
+        let kimi = catalog_model(&catalog, "kimi-k3");
+        assert_eq!(kimi["access"], "pro");
+        assert_eq!(kimi["provider_id"], "kimi-k3");
+        assert_eq!(kimi["context_window"], 262_144);
+        assert_eq!(kimi["input_modalities"], json!(["text", "image"]));
+        assert_eq!(kimi["output_modalities"], json!(["text"]));
+        assert_eq!(kimi["parameter_size"], "2.8T");
+        assert_eq!(kimi["active_parameter_size"], "104B");
+        assert_eq!(kimi["capabilities"]["vision"], true);
+        assert_eq!(kimi["capabilities"]["reasoning"], true);
+        assert_eq!(kimi["capabilities"]["tool_use"], true);
+        assert_eq!(kimi["tasks"], json!(["generate", "vision"]));
+
+        assert!(!has_model(&catalog, "deepseek-v4-flash"));
+
+        let deepseek_v41 = catalog_model(&catalog, DEEPSEEK_V4_1_FLASH_MODEL_ID);
+        assert_eq!(deepseek_v41["access"], "pro");
+        assert_eq!(deepseek_v41["provider_id"], DEEPSEEK_V4_1_FLASH_MODEL_ID);
+        assert_eq!(deepseek_v41["display_name"], "DeepSeek V4.1 Flash");
+        assert_eq!(deepseek_v41["context_window"], 1_048_576);
+        assert_eq!(deepseek_v41["input_modalities"], json!(["text", "image"]));
+        assert_eq!(deepseek_v41["output_modalities"], json!(["text"]));
+        assert_eq!(deepseek_v41["parameter_size"], "552B");
+        assert_eq!(deepseek_v41["active_parameter_size"], "16B");
+        assert_eq!(deepseek_v41["capabilities"]["vision"], true);
+        assert_eq!(deepseek_v41["capabilities"]["reasoning"], true);
+        assert_eq!(deepseek_v41["capabilities"]["tool_use"], true);
+        assert_eq!(deepseek_v41["tasks"], json!(["generate", "vision"]));
+
+        let minimal = openai_models_response();
+        let minimal_kimi = catalog_model(&minimal, "kimi-k3");
+        assert!(minimal_kimi.get("input_modalities").is_none());
+        assert!(minimal_kimi.get("parameter_size").is_none());
+    }
+
+    #[test]
+    fn test_catalog_publishes_the_verified_reasoning_controls_per_model() {
+        // (model, mandatory, default_enabled, supported efforts highest first, default)
+        type Expected = (
+            &'static str,
+            bool,
+            bool,
+            Option<&'static [&'static str]>,
+            Option<&'static str>,
+        );
+        let expected: [Expected; 9] = [
+            (
+                "gpt-oss-120b",
+                true,
+                true,
+                Some(&["high", "medium", "low"]),
+                Some("medium"),
+            ),
+            (
+                "gpt-oss-safeguard-120b",
+                true,
+                true,
+                Some(&["high", "medium", "low"]),
+                Some("medium"),
+            ),
+            ("gemma4-31b", false, false, None, None),
+            (
+                "kimi-k3",
+                false,
+                true,
+                Some(&["max", "high", "low"]),
+                Some("max"),
+            ),
+            (
+                "glm-5-3",
+                true,
+                true,
+                Some(&["max", "high", "low"]),
+                Some("max"),
+            ),
+            (
+                "glm-5-3-flash",
+                true,
+                true,
+                Some(&["max", "high", "low"]),
+                Some("max"),
+            ),
+            (
+                "deepseek-v4-1-flash",
+                false,
+                true,
+                Some(&["max", "xhigh", "high", "low"]),
+                Some("high"),
+            ),
+            (
+                DEEPSEEK_V4_1_FLASH_UNCENSORED_MODEL_ID,
+                false,
+                true,
+                Some(&["max", "xhigh", "high", "low"]),
+                Some("high"),
+            ),
+            ("llama3-3-70b", false, false, None, None),
+        ];
+        assert_eq!(expected.len(), MODEL_CONFIGS.len());
+        let models = openai_models_response();
+
+        for (model, mandatory, default_enabled, supported, default_effort) in expected {
+            let entry = model_entry(model).expect("catalog model");
+            let listed = models["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|listed| listed["id"] == model)
+                .expect("listed model");
+            assert_eq!(
+                listed["max_completion_tokens"],
+                json!(entry.config.context_window),
+                "{model}"
+            );
+            match entry.config.reasoning {
+                None => {
+                    assert!(!entry.capabilities.reasoning, "{model}");
+                    assert!(listed.get("reasoning").is_none(), "{model}");
+                }
+                Some(reasoning) => {
+                    assert!(entry.capabilities.reasoning, "{model}");
+                    assert_eq!(reasoning.mandatory, mandatory, "{model}");
+                    assert_eq!(reasoning.default_enabled, default_enabled, "{model}");
+                    let published = &listed["reasoning"];
+                    assert_eq!(published["mandatory"], json!(mandatory), "{model}");
+                    assert_eq!(
+                        published["default_enabled"],
+                        json!(default_enabled),
+                        "{model}"
+                    );
+                    assert_eq!(
+                        published.get("supported_efforts").cloned(),
+                        supported.map(|efforts| json!(efforts)),
+                        "{model}"
+                    );
+                    assert_eq!(
+                        published.get("default_effort").cloned(),
+                        default_effort.map(|effort| json!(effort)),
+                        "{model}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_reasoning_controls_match_between_catalog_and_models_endpoints() {
+        let catalog = model_catalog_response(ModelPlan::Paid);
+        let models = openai_models_response();
+        for model in catalog["data"].as_array().expect("catalog data") {
+            let listed = models["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|listed| listed["id"] == model["id"])
+                .expect("every catalog model is listed");
+            assert_eq!(
+                model.get("reasoning"),
+                listed.get("reasoning"),
+                "{}",
+                model["id"]
+            );
+            assert_eq!(
+                model["max_completion_tokens"], listed["max_completion_tokens"],
+                "{}",
+                model["id"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_reasoning_effort_round_trips_openai_spellings() {
+        for effort in ReasoningEffort::ALL {
+            assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
+        }
+        assert_eq!(ReasoningEffort::parse("ultra"), None);
+        assert_eq!(ReasoningEffort::parse("Low"), None);
+        assert!(ReasoningEffort::None < ReasoningEffort::Minimal);
+        assert!(ReasoningEffort::XHigh < ReasoningEffort::Max);
+    }
+
+    #[test]
+    fn test_reasoning_accepts_and_clamps_per_model() {
+        let glm = model_reasoning(GLM_5_3_MODEL_ID).unwrap();
+        assert!(!glm.accepts(ReasoningEffort::None));
+        assert!(!glm.accepts(ReasoningEffort::Medium));
+        assert!(glm.accepts(ReasoningEffort::Max));
+        assert_eq!(glm.clamp(ReasoningEffort::None), ReasoningEffort::Low);
+        assert_eq!(glm.clamp(ReasoningEffort::Minimal), ReasoningEffort::Low);
+        assert_eq!(glm.clamp(ReasoningEffort::Medium), ReasoningEffort::High);
+        assert_eq!(glm.clamp(ReasoningEffort::XHigh), ReasoningEffort::Max);
+        assert_eq!(glm.clamp(ReasoningEffort::High), ReasoningEffort::High);
+
+        let gpt_oss = model_reasoning(QUICK_MODEL_ID).unwrap();
+        assert_eq!(gpt_oss.clamp(ReasoningEffort::Max), ReasoningEffort::High);
+        assert_eq!(gpt_oss.clamp(ReasoningEffort::XHigh), ReasoningEffort::High);
+        assert_eq!(gpt_oss.clamp(ReasoningEffort::None), ReasoningEffort::Low);
+
+        let kimi = model_reasoning(KIMI_K3_MODEL_ID).unwrap();
+        assert!(kimi.accepts(ReasoningEffort::None));
+        assert_eq!(kimi.clamp(ReasoningEffort::Medium), ReasoningEffort::High);
+        assert_eq!(
+            kimi.accepted_efforts(),
+            vec![
+                ReasoningEffort::None,
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max
+            ]
+        );
+
+        let gemma = model_reasoning("gemma4-31b").unwrap();
+        for effort in ReasoningEffort::ALL {
+            assert!(gemma.accepts(effort), "{effort:?}");
+        }
+        assert_eq!(model_reasoning("llama3-3-70b"), None);
+        assert_eq!(model_reasoning(AUTO_QUICK_MODEL_ID), None);
+    }
+
+    #[test]
+    fn test_alias_reasoning_is_what_every_candidate_accepts() {
+        // Paid Quick may run on GLM-5.3-Flash or DeepSeek: xhigh and none are
+        // not shared, so neither is promised; Flash's mandatory reasoning wins.
+        let paid_quick = alias_reasoning(AUTO_QUICK_MODEL_ID, ModelPlan::Paid).unwrap();
+        assert_eq!(
+            paid_quick.json(),
+            json!({
+                "mandatory": true,
+                "default_enabled": true,
+                "supported_efforts": ["max", "high", "low"],
+                "default_effort": "max"
+            })
+        );
+        // Paid Powerful may run on GLM-5.3 or Kimi K3.
+        let paid_powerful = alias_reasoning(AUTO_POWERFUL_MODEL_ID, ModelPlan::Paid).unwrap();
+        assert_eq!(paid_powerful, paid_quick);
+        // Free aliases have no alternates and publish their target's controls.
+        assert_eq!(
+            alias_reasoning(AUTO_QUICK_MODEL_ID, ModelPlan::Free),
+            model_reasoning(QUICK_MODEL_ID)
+        );
+        assert_eq!(
+            alias_reasoning(AUTO_POWERFUL_MODEL_ID, ModelPlan::Free),
+            model_reasoning(GLM_5_3_MODEL_ID)
+        );
+        assert_eq!(alias_reasoning(GLM_5_3_MODEL_ID, ModelPlan::Paid), None);
+
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let catalog = model_catalog_response(plan);
+            for alias in catalog["aliases"].as_array().expect("aliases") {
+                let selector = alias["id"].as_str().expect("alias ID");
+                let reasoning = alias_reasoning(selector, plan).expect("alias reasoning");
+                assert_eq!(alias["reasoning"], reasoning.json(), "{selector} {plan:?}");
+                assert!(
+                    reasoning
+                        .supported_efforts
+                        .is_none_or(|efforts| !efforts.is_empty()),
+                    "{selector} {plan:?} must accept some effort"
+                );
+                let target = catalog_model(&catalog, alias["target_model"].as_str().unwrap());
+                assert_eq!(alias["context_window"], target["context_window"]);
+                assert_eq!(
+                    alias["max_completion_tokens"],
+                    target["max_completion_tokens"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek_catalog_lists_only_the_canonical_public_model() {
+        for catalog in [
+            model_catalog_response(ModelPlan::Free),
+            model_catalog_response(ModelPlan::Paid),
+            openai_models_response(),
+        ] {
+            assert!(has_model(&catalog, DEEPSEEK_V4_1_FLASH_MODEL_ID));
+            assert!(!has_model(&catalog, "deepseek-v4-1-flash-1017"));
+            assert_eq!(
+                catalog["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|entry| entry["id"] == DEEPSEEK_V4_1_FLASH_MODEL_ID)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                model_ids_with_badge(&catalog, "New"),
+                vec![DEEPSEEK_V4_1_FLASH_MODEL_ID.to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_has_one_public_identity_without_a_checkpoint_alias() {
+        assert_eq!(
+            resolve_public_model_id(DEEPSEEK_V4_1_FLASH_MODEL_ID),
+            Some(DEEPSEEK_V4_1_FLASH_MODEL_ID)
+        );
+        for retired in ["deepseek-v4-1-flash-1017", "deepseek-v4-1-flash-1017-extra"] {
+            assert_eq!(resolve_public_model_id(retired), None);
+            assert!(!enabled_api_completion_model_ids().any(|model| model == retired));
+        }
+        assert!(
+            enabled_api_completion_model_ids().any(|model| model == DEEPSEEK_V4_1_FLASH_MODEL_ID)
+        );
+        assert!(!ModelPlan::Free.allows_model(DEEPSEEK_V4_1_FLASH_MODEL_ID));
+        assert!(ModelPlan::Paid.allows_model(DEEPSEEK_V4_1_FLASH_MODEL_ID));
+        let catalog = model_catalog_response(ModelPlan::Paid);
+        let deepseek = catalog_model(&catalog, DEEPSEEK_V4_1_FLASH_MODEL_ID);
+        assert_eq!(deepseek["provider_id"], DEEPSEEK_V4_1_FLASH_MODEL_ID);
+        assert_eq!(deepseek["display_name"], "DeepSeek V4.1 Flash");
+    }
+
+    #[test]
+    fn deepseek_provider_rollout_preserves_auto_defaults_and_candidates() {
+        let expected = [
+            (ModelPlan::Free, AUTO_QUICK_MODEL_ID, vec![QUICK_MODEL_ID]),
+            (
+                ModelPlan::Free,
+                AUTO_POWERFUL_MODEL_ID,
+                vec![GLM_5_3_MODEL_ID],
+            ),
+            (
+                ModelPlan::Paid,
+                AUTO_QUICK_MODEL_ID,
+                vec![GLM_5_3_FLASH_MODEL_ID, DEEPSEEK_V4_1_FLASH_MODEL_ID],
+            ),
+            (
+                ModelPlan::Paid,
+                AUTO_POWERFUL_MODEL_ID,
+                vec![GLM_5_3_MODEL_ID, KIMI_K3_MODEL_ID],
+            ),
+        ];
+        for (plan, selector, candidates) in expected {
+            assert_eq!(
+                ModelAliasTargets::for_plan(plan).resolve(selector),
+                candidates[0]
+            );
+            assert_eq!(
+                auto_model_candidates(ModelSelectionMode::from_requested_model(selector), plan),
+                Some(candidates)
+            );
+        }
+    }
+}

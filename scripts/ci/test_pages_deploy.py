@@ -1,0 +1,627 @@
+"""Attack and regression cases for the trusted publisher, without live writes."""
+
+import copy
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tarfile
+import tempfile
+import unittest
+import zipfile
+from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pages_deploy as pages
+
+SHA = "a" * 40
+OLD_SHA = "b" * 40
+OTHER_SHA = "c" * 40
+REPO_ID = 923138240
+
+
+class MemoryAPI:
+    def __init__(self, values):
+        self.values = values
+
+    def json(self, path, method="GET", data=None):
+        if method != "GET":
+            raise AssertionError("Selection must never mutate GitHub")
+        return copy.deepcopy(self.values[path])
+
+
+class DeploymentReportingTests(unittest.TestCase):
+    def test_reports_artifact_sha_when_publisher_checks_out_newer_master(self):
+        for target, branch, environment in (
+            ("production", "pages-production", "pages-production"),
+            ("preview", "master", "pages-master"),
+        ):
+            with self.subTest(target=target):
+                gh = Mock()
+                gh.write.return_value = {"id": 123}
+                plan = {"target": target, "branch": branch, "sha": SHA}
+                result = {"url": "https://12345678.maple-ca8.pages.dev"}
+                with patch.dict(os.environ, {"GITHUB_SHA": OTHER_SHA}):
+                    pages.report(gh, plan, result)
+                self.assertEqual(gh.write.call_count, 2)
+                creation, success = gh.write.call_args_list
+                self.assertEqual(creation.args[0], "/deployments")
+                self.assertEqual(creation.args[1]["ref"], SHA)
+                self.assertEqual(creation.args[1]["environment"], environment)
+                self.assertEqual(success.args[0], "/deployments/123/statuses")
+                self.assertEqual(success.args[1]["state"], "success")
+                self.assertEqual(
+                    success.args[1]["environment_url"],
+                    "https://app.maple.ai" if target == "production" else result["url"],
+                )
+
+
+class ProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = "OpenSecretCloud/Maple"
+        self.root = "/repos/" + self.repo
+        self.run = {"id": 100, "workflow_id": 10, "path": ".github/workflows/pages-preview-build.yml",
+                    "event": "pull_request", "status": "completed", "conclusion": "success",
+                    "run_attempt": 2, "head_sha": SHA, "head_branch": "feature", "pull_requests": [],
+                    "repository": {"id": REPO_ID}, "head_repository": {"id": REPO_ID}}
+        self.pr = {"number": 877, "state": "open", "base": {"ref": "master", "repo": {"id": REPO_ID}},
+                   "head": {"sha": SHA, "ref": "feature", "repo": {"id": REPO_ID}}}
+        self.artifact = {"id": 300, "name": "maple-pages-preview-100-2", "expired": False,
+                         "digest": "sha256:" + "d" * 64, "size_in_bytes": 1000}
+        self.values = {self.root: {"id": REPO_ID, "default_branch": "master"},
+                       self.root + "/actions/runs/100": self.run,
+                       self.root + "/actions/workflows/pages-preview-build.yml": {"id": 10},
+                       self.root + f"/commits/{SHA}/pulls?per_page=100": [{"number": 877}],
+                       self.root + "/pulls/877": self.pr,
+                       self.root + "/git/ref/heads/master": {"object": {"sha": SHA}},
+                       self.root + "/actions/runs/100/artifacts?per_page=100": {"total_count": 1, "artifacts": [self.artifact]}}
+        self.event = {"workflow_run": copy.deepcopy(self.run)}
+        self.gh = pages.GitHub(MemoryAPI(self.values), self.repo, REPO_ID)
+
+    def select(self):
+        return pages.select_plan(self.gh, self.event, "preview")
+
+    def test_internal_pr_with_empty_event_pr_list(self):
+        plan = self.select()
+        self.assertEqual((plan["branch"], plan["profile"], plan["sha"]), ("pr-877", "pr", SHA))
+        self.assertEqual(plan["artifact_id"], 300)
+
+    def test_owner_rename_does_not_change_repository_identity(self):
+        new_repo = "MaplePrivacyLabs/Maple"
+        moved = {key.replace(self.root, "/repos/" + new_repo): value for key, value in self.values.items()}
+        gh = pages.GitHub(MemoryAPI(moved), new_repo, REPO_ID)
+        self.assertEqual(pages.select_plan(gh, self.event, "preview")["sha"], SHA)
+
+    def test_fork_run_never_eligible_even_when_pr_commit_is_shared(self):
+        self.run["head_repository"]["id"] = 99
+        with self.assertRaises(pages.Rejected):
+            self.select()
+
+    def test_fork_pr_rejected_even_if_workflow_metadata_claims_internal(self):
+        self.pr["head"]["repo"]["id"] = 99
+        with self.assertRaises(pages.Superseded):
+            self.select()
+
+    def test_closed_changed_head_and_wrong_base_prs(self):
+        for mutate in (lambda: self.pr.update(state="closed"),
+                       lambda: self.pr["head"].update(sha=OTHER_SHA),
+                       lambda: self.pr["base"].update(ref="not-master"),
+                       lambda: self.pr["base"]["repo"].update(id=99),
+                       lambda: self.pr["head"].update(repo=None),
+                       lambda: self.pr["head"].update(ref="other-branch")):
+            original = copy.deepcopy(self.pr)
+            mutate()
+            with self.assertRaises(pages.Superseded):
+                self.select()
+            self.pr.clear()
+            self.pr.update(original)
+
+    def test_run_attempt_race(self):
+        self.run["run_attempt"] = 3
+        with self.assertRaises(pages.Superseded):
+            self.select()
+
+    def test_wrong_workflow_identity_path_or_event(self):
+        for key, value in (("workflow_id", 123), ("path", ".github/workflows/evil.yml"),
+                           ("event", "pull_request_target"), ("conclusion", "failure"), ("status", "in_progress")):
+            old = self.run[key]
+            self.run[key] = value
+            with self.assertRaises(pages.Rejected):
+                self.select()
+            self.run[key] = old
+
+    def test_trigger_sha_must_agree_with_api(self):
+        self.event["workflow_run"]["head_sha"] = OTHER_SHA
+        with self.assertRaises(pages.Rejected):
+            self.select()
+
+    def test_previous_attempt_artifact_not_selected(self):
+        self.artifact["name"] = "maple-pages-preview-100-1"
+        with self.assertRaises(pages.Rejected):
+            self.select()
+
+    def test_duplicate_expired_and_unsigned_artifacts_rejected(self):
+        artifact_list = self.values[self.root + "/actions/runs/100/artifacts?per_page=100"]["artifacts"]
+        artifact_list.append(copy.deepcopy(self.artifact))
+        with self.assertRaises(pages.Rejected):
+            self.select()
+        artifact_list.pop()
+        self.artifact["expired"] = True
+        with self.assertRaises(pages.Rejected):
+            self.select()
+        self.artifact["expired"] = False
+        self.artifact["digest"] = None
+        with self.assertRaises(pages.Rejected):
+            self.select()
+
+    def test_master_preview_is_dev_and_must_be_current(self):
+        self.run.update(event="push", head_branch="master")
+        self.event = {"workflow_run": copy.deepcopy(self.run)}
+        plan = self.select()
+        self.assertEqual((plan["profile"], plan["branch"], plan["pr_number"]), ("pr", "master", None))
+        self.values[self.root + "/git/ref/heads/master"]["object"]["sha"] = OTHER_SHA
+        with self.assertRaises(pages.Superseded):
+            self.select()
+
+    def setup_release(self):
+        self.run.update(event="release", head_branch="v3.3.10", path=".github/workflows/release.yml", workflow_id=11)
+        self.event = {"workflow_run": copy.deepcopy(self.run)}
+        self.release = {"id": 900, "tag_name": "v3.3.10", "draft": False, "prerelease": False,
+                        "assets": [{"id": 1, "name": "maple-web-dist.tar.gz", "state": "uploaded", "size": 8000,
+                                    "digest": "sha256:" + "d" * 64},
+                                   {"id": 2, "name": "web-final.sha256", "state": "uploaded", "size": 130,
+                                    "digest": "sha256:" + "e" * 64}]}
+        self.values.update({self.root + "/releases/latest": self.release,
+                            self.root + "/commits/v3.3.10": {"sha": SHA},
+                            self.root + "/actions/workflows/release.yml": {"id": 11},
+                            self.root + f"/compare/{SHA}...master": {"status": "ahead"},
+                            self.root + "/git/ref/heads/pages-production": {"object": {"sha": OLD_SHA}},
+                            self.root + f"/compare/{OLD_SHA}...{SHA}": {"status": "ahead"},
+                            self.root + f"/actions/workflows/release.yml/runs?event=release&head_sha={SHA}&per_page=100": {"workflow_runs": [self.run]}})
+
+    def production(self):
+        return pages.select_plan(self.gh, self.event, "production")
+
+    def setup_production_build(self):
+        self.run.update(event="workflow_dispatch", head_branch="master",
+                        path=".github/workflows/pages-production-build.yml", workflow_id=12)
+        self.artifact["name"] = "maple-pages-production-100-2"
+        self.event = {"inputs": {"build_run_id": "100", "build_run_attempt": "2"}}
+        self.values.update({self.root + "/actions/workflows/pages-production-build.yml": {"id": 12},
+                            self.root + "/git/ref/heads/pages-production": {"object": {"sha": OLD_SHA}},
+                            self.root + f"/compare/{OLD_SHA}...{SHA}": {"status": "ahead"}})
+
+    def test_manual_production_selects_exact_master_build_and_attempt(self):
+        self.setup_production_build()
+        plan = self.production()
+        self.assertEqual((plan["profile"], plan["branch"], plan["sha"], plan["previous_sha"]),
+                         ("release", "pages-production", SHA, OLD_SHA))
+        self.assertEqual((plan["run_id"], plan["run_attempt"], plan["artifact_id"]), (100, 2, 300))
+        self.assertNotIn("release_id", plan)
+        self.values[self.root + "/git/ref/heads/pages-production"]["object"]["sha"] = SHA
+        self.assertEqual(self.production()["previous_sha"], SHA)
+
+    def test_manual_production_rejects_malformed_and_partial_selection_without_release_fallback(self):
+        self.setup_production_build()
+        for field in ("build_run_id", "build_run_attempt"):
+            for invalid in (None, True, 100, "", "0", "01", "-1", "1.0", " 1", "1\n", "1;echo no", "1" * 21):
+                with self.subTest(field=field, invalid=invalid):
+                    event = copy.deepcopy(self.event)
+                    event["inputs"][field] = invalid
+                    with self.assertRaises(pages.Rejected):
+                        pages.select_plan(self.gh, event, "production")
+        for inputs in ([], {"workflow": "evil.yml"}, {"build_run_id": "100"}, {"build_run_attempt": "2"}):
+            with self.subTest(inputs=inputs), self.assertRaises(pages.Rejected):
+                pages.select_plan(self.gh, {"inputs": inputs}, "production")
+        self.event["workflow_run"] = copy.deepcopy(self.run)
+        with self.assertRaises(pages.Rejected):
+            self.production()
+
+    def test_manual_production_rejects_wrong_run_workflow_event_branch_and_repository(self):
+        self.setup_production_build()
+        for key, value in (("id", 101), ("workflow_id", 13), ("path", ".github/workflows/pages-preview-build.yml"),
+                           ("event", "push"), ("head_branch", "feature"), ("conclusion", "failure"),
+                           ("status", "in_progress"), ("repository", {"id": 99}), ("head_repository", {"id": 99})):
+            with self.subTest(key=key):
+                old = self.run[key]
+                self.run[key] = value
+                with self.assertRaises(pages.Rejected):
+                    self.production()
+                self.run[key] = old
+
+    def test_manual_production_rejects_superseded_master_attempt_and_nonforward_ref(self):
+        self.setup_production_build()
+        self.run["run_attempt"] = 3
+        with self.assertRaises(pages.Superseded):
+            self.production()
+        self.run["run_attempt"] = 2
+        self.values[self.root + "/git/ref/heads/master"]["object"]["sha"] = OTHER_SHA
+        with self.assertRaises(pages.Superseded):
+            self.production()
+        self.values[self.root + "/git/ref/heads/master"]["object"]["sha"] = SHA
+        self.values[self.root + f"/compare/{OLD_SHA}...{SHA}"]["status"] = "behind"
+        with self.assertRaises(pages.Rejected):
+            self.production()
+
+    def test_manual_production_rejects_missing_ambiguous_expired_or_unsigned_artifact(self):
+        self.setup_production_build()
+        for key, value in (("name", "maple-pages-production-100-1"), ("name", "maple-pages-preview-100-2"),
+                           ("expired", True), ("digest", None), ("size_in_bytes", True),
+                           ("size_in_bytes", pages.MAX_DOWNLOAD + 1)):
+            with self.subTest(key=key, value=value):
+                old = self.artifact[key]
+                self.artifact[key] = value
+                with self.assertRaises(pages.Rejected):
+                    self.production()
+                self.artifact[key] = old
+        self.values[self.root + "/actions/runs/100/artifacts?per_page=100"]["artifacts"].append(self.artifact)
+        with self.assertRaises(pages.Rejected):
+            self.production()
+
+    def production_build_api(self, manifest_changes=None, wrong_digest=False):
+        archive = io.BytesIO()
+        contents = b"<html>Production web fixture</html>"
+        with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+            member = tarfile.TarInfo("index.html")
+            member.size = len(contents)
+            bundle.addfile(member, io.BytesIO(contents))
+        manifest = {"schema_version": 1, "profile": "release", "source_sha": SHA, "run_id": 100,
+                    "run_attempt": 2, "archive_sha256": hashlib.sha256(archive.getvalue()).hexdigest()}
+        manifest.update(manifest_changes or {})
+        zipped = io.BytesIO()
+        with zipfile.ZipFile(zipped, "w") as bundle:
+            bundle.writestr("maple-web-dist.tar.gz", archive.getvalue())
+            bundle.writestr("pages-artifact.json", json.dumps(manifest))
+        body = zipped.getvalue()
+        self.artifact.update(size_in_bytes=len(body), digest="sha256:" + (
+            "0" * 64 if wrong_digest else hashlib.sha256(body).hexdigest()))
+        api = pages.API("https://api.github.com", "fake-web-build-canary")
+
+        def request(path, method="GET", data=None, accept="application/vnd.github+json"):
+            self.assertEqual(method, "GET")
+            self.assertIsNone(data)
+            self.assertEqual(accept, "application/vnd.github+json")
+            if path == self.root + "/actions/artifacts/300/zip":
+                return io.BytesIO(body)
+            return io.BytesIO(json.dumps(self.values[path]).encode())
+
+        api.request = Mock(side_effect=request)
+        return pages.GitHub(api, self.repo, REPO_ID), contents
+
+    def test_manual_production_prepares_real_release_profile_zip(self):
+        self.setup_production_build()
+        gh, contents = self.production_build_api()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "prepared"
+            plan = pages.prepare(gh, self.event, "production", state)
+            self.assertEqual(plan["artifact_id"], 300)
+            self.assertEqual((state / "assets/index.html").read_bytes(), contents)
+            saved = json.loads((state / "plan.json").read_text())
+            self.assertEqual(saved["files"], {"index.html": hashlib.sha256(contents).hexdigest()})
+
+    def test_manual_production_rejects_profile_identity_and_digest_substitution_before_extraction(self):
+        self.setup_production_build()
+        for changes, wrong_digest in (({"profile": "pr"}, False), ({"profile": "auth-release"}, False),
+                                      ({"source_sha": OTHER_SHA}, False), ({"run_id": 101}, False),
+                                      ({"run_attempt": 1}, False), ({"archive_sha256": "0" * 64}, False), ({}, True)):
+            with self.subTest(changes=changes, wrong_digest=wrong_digest), tempfile.TemporaryDirectory() as tmp:
+                gh, _ = self.production_build_api(changes, wrong_digest)
+                state = Path(tmp) / "prepared"
+                with self.assertRaises(ValueError):
+                    pages.prepare(gh, self.event, "production", state)
+                self.assertFalse((state / "assets").exists())
+
+    def test_manual_production_rechecks_selection_before_and_after_upload(self):
+        self.setup_production_build()
+        gh, _ = self.production_build_api()
+        for change_after_upload in (False, True):
+            with self.subTest(change_after_upload=change_after_upload), tempfile.TemporaryDirectory() as tmp:
+                self.values[self.root + "/git/ref/heads/master"]["object"]["sha"] = SHA
+                state = Path(tmp) / "prepared"
+                pages.prepare(gh, self.event, "production", state)
+
+                def change_source(*args):
+                    self.values[self.root + "/git/ref/heads/master"]["object"]["sha"] = OTHER_SHA
+
+                if not change_after_upload:
+                    change_source()
+                with patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": "a" * 32, "CLOUDFLARE_API_TOKEN": "fake"}), \
+                     patch.object(pages, "cloudflare_project"), patch.object(pages, "run_wrangler") as upload, \
+                     patch.object(pages, "verify_deployment", side_effect=change_source), \
+                     patch.object(gh, "write") as write, self.assertRaises(pages.Superseded):
+                    pages.deploy(gh, self.event, state)
+                self.assertEqual(upload.call_count, 1 if change_after_upload else 0)
+                write.assert_not_called()
+
+    def test_blank_manual_inputs_keep_stable_release_selection(self):
+        self.setup_release()
+        self.event = {"inputs": {"build_run_id": "", "build_run_attempt": ""}}
+        self.assertEqual(self.production()["release_id"], 900)
+
+    def test_older_stable_release_cannot_overwrite_newer_manual_web_source(self):
+        self.setup_release()
+        self.values[self.root + "/git/ref/heads/pages-production"]["object"]["sha"] = OTHER_SHA
+        self.values[self.root + f"/compare/{OTHER_SHA}...{SHA}"] = {"status": "behind"}
+        for event in (self.event, {}):
+            with self.subTest(event=event), self.assertRaises(pages.Rejected):
+                pages.select_plan(self.gh, event, "production")
+
+    def test_release_selects_exact_production_asset(self):
+        self.setup_release()
+        plan = self.production()
+        self.assertEqual((plan["branch"], plan["profile"], plan["sha"]), ("pages-production", "release", SHA))
+        self.assertEqual(plan["archive"]["id"], 1)
+
+    def test_current_release_can_be_redeployed_without_a_new_release(self):
+        self.setup_release()
+        self.values[self.root + "/git/ref/heads/pages-production"]["object"]["sha"] = SHA
+        self.event = {}
+        self.assertEqual(self.production()["previous_sha"], SHA)
+
+    def transferred_release_values(self):
+        self.setup_release()
+        self.values[self.root + "/git/ref/heads/pages-production"]["object"]["sha"] = SHA
+        for key in ("repository", "head_repository"):
+            self.run[key].update(full_name=self.repo, owner={"id": 185423582})
+        for asset in self.release["assets"]:
+            asset["browser_download_url"] = (
+                f"https://github.com/{self.repo}/releases/download/v3.3.10/{asset['name']}"
+            )
+        new_repo = "MaplePrivacyLabs/Maple"
+        new_root = "/repos/" + new_repo
+        moved = {key.replace(self.root, new_root, 1): value for key, value in self.values.items()}
+        moved[new_root] = {"id": REPO_ID, "default_branch": "master", "full_name": new_repo,
+                           "owner": {"id": 322649754}}
+        return new_repo, moved
+
+    def assert_production_prepare_checksum_path(self, checksum_path, rejected=False):
+        new_repo, moved = self.transferred_release_values()
+        archive = io.BytesIO()
+        contents = b"<html>Retained production release</html>"
+        with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+            member = tarfile.TarInfo("index.html")
+            member.size = len(contents)
+            bundle.addfile(member, io.BytesIO(contents))
+        archive_bytes = archive.getvalue()
+        archive_digest = hashlib.sha256(archive_bytes).hexdigest()
+        checksum = f"{archive_digest}  {checksum_path}\n".encode()
+        new_root = "/repos/" + new_repo
+        downloads = {}
+        for asset, body in zip(self.release["assets"], (archive_bytes, checksum)):
+            asset.update(size=len(body), digest="sha256:" + hashlib.sha256(body).hexdigest())
+            downloads[f"{new_root}/releases/assets/{asset['id']}"] = body
+
+        def request(path, method="GET", data=None, accept="application/vnd.github+json"):
+            self.assertEqual(method, "GET")
+            self.assertIsNone(data)
+            self.assertTrue(path.startswith(new_root))
+            if path in downloads:
+                self.assertEqual(accept, "application/octet-stream")
+                return io.BytesIO(downloads[path])
+            return io.BytesIO(json.dumps(moved[path]).encode())
+
+        api = pages.API("https://api.github.com", "fake-transfer-canary")
+        gh = pages.GitHub(api, new_repo, REPO_ID)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(api, "request", side_effect=request) as read:
+            state = Path(tmp) / "prepared"
+            if rejected:
+                with self.assertRaises(pages.Rejected):
+                    pages.prepare(gh, {}, "production", state)
+                self.assertFalse((state / "assets").exists())
+                return
+            plan = pages.prepare(gh, {}, "production", state)
+            self.assertEqual((plan["target"], plan["profile"], plan["sha"], plan["previous_sha"]),
+                             ("production", "release", SHA, SHA))
+            self.assertEqual((plan["release_id"], plan["run_id"], plan["run_attempt"]), (900, 100, 2))
+            self.assertEqual((state / "assets/index.html").read_bytes(), contents)
+            saved = json.loads((state / "plan.json").read_text())
+            self.assertEqual(saved["files"], {"index.html": hashlib.sha256(contents).hexdigest()})
+            self.assertEqual([call.args[0] for call in read.call_args_list if call.args[0] in downloads],
+                             list(downloads))
+
+    def test_production_prepare_accepts_retained_and_relocated_release_checksums(self):
+        for path in (
+            "maple-web-dist.tar.gz",
+            "frontend/src-tauri/target/reproducibility/maple-web-dist.tar.gz",
+            "apps/maple-research/frontend/src-tauri/target/reproducibility/maple-web-dist.tar.gz",
+        ):
+            with self.subTest(path=path):
+                self.assert_production_prepare_checksum_path(path)
+
+    def test_production_prepare_rejects_other_checksum_paths_before_extraction(self):
+        for path in (
+            "apps/other/frontend/src-tauri/target/reproducibility/maple-web-dist.tar.gz",
+            "apps/maple-research/frontend/../src-tauri/target/reproducibility/maple-web-dist.tar.gz",
+            "/apps/maple-research/frontend/src-tauri/target/reproducibility/maple-web-dist.tar.gz",
+            "apps/maple-research/frontend/src-tauri/target/reproducibility/other.tar.gz",
+            "maple-web-dist.tar.gz\n" + "0" * 64 + "  extra.tar.gz",
+        ):
+            with self.subTest(path=path):
+                self.assert_production_prepare_checksum_path(path, rejected=True)
+
+    def test_transferred_production_rejects_wrong_or_missing_repository_ids_before_download(self):
+        new_repo, moved = self.transferred_release_values()
+        new_root = "/repos/" + new_repo
+        for location in ("current", "repository", "head_repository"):
+            for missing in (False, True):
+                with self.subTest(location=location, missing=missing):
+                    values = copy.deepcopy(moved)
+                    identity = (values[new_root] if location == "current"
+                                else values[new_root + "/actions/runs/100"][location])
+                    if missing:
+                        del identity["id"]
+                    else:
+                        identity["id"] = 99
+                    api = MemoryAPI(values)
+                    api.download = Mock(side_effect=AssertionError("Untrusted release must not be downloaded"))
+                    gh = pages.GitHub(api, new_repo, REPO_ID)
+                    with tempfile.TemporaryDirectory() as tmp, self.assertRaises((pages.Rejected, KeyError)):
+                        pages.prepare(gh, {}, "production", Path(tmp) / "prepared")
+                    api.download.assert_not_called()
+
+    def test_draft_prerelease_and_malformed_tag_rejected(self):
+        self.setup_release()
+        for field, value in (("draft", True), ("prerelease", True), ("tag_name", "v3.3.10\n::error::injection")):
+            old = self.release[field]
+            self.release[field] = value
+            with self.assertRaises(pages.Rejected):
+                self.production()
+            self.release[field] = old
+
+    def test_release_superseded_by_new_tag(self):
+        self.setup_release()
+        self.event["workflow_run"]["head_branch"] = "v3.3.9"
+        with self.assertRaises(pages.Superseded):
+            self.production()
+
+    def test_release_run_must_match_tag_sha(self):
+        self.setup_release()
+        self.run["head_sha"] = OTHER_SHA
+        with self.assertRaises(pages.Rejected):
+            self.production()
+
+    def test_release_must_be_on_master_and_forward(self):
+        self.setup_release()
+        for path in (f"/compare/{SHA}...master", f"/compare/{OLD_SHA}...{SHA}"):
+            self.values[self.root + path]["status"] = "diverged"
+            with self.assertRaises(pages.Rejected):
+                self.production()
+            self.values[self.root + path]["status"] = "ahead"
+
+    def test_manual_retry_does_not_accept_failed_release(self):
+        self.setup_release()
+        self.event = {}
+        self.run["conclusion"] = "failure"
+        with self.assertRaises(pages.Rejected):
+            self.production()
+
+    def test_release_digest_and_asset_uniqueness_required(self):
+        self.setup_release()
+        self.release["assets"].append(copy.deepcopy(self.release["assets"][0]))
+        with self.assertRaises(pages.Rejected):
+            self.production()
+        self.release["assets"].pop()
+        self.release["assets"][0]["digest"] = None
+        with self.assertRaises(pages.Rejected):
+            self.production()
+
+
+class ProcessAndTransportTests(unittest.TestCase):
+    def test_wrangler_rejects_ancestor_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            cwd = parent / "nested" / "runner"
+            cwd.mkdir(parents=True)
+            # Isolate test from the host's own ancestors; only our fixture matters.
+            for name in ("wrangler.toml", "wrangler.json", "wrangler.jsonc", "package.json", ".env", ".dev.vars"):
+                config = parent / name
+                config.write_text("fixture")
+                with self.assertRaises(pages.Rejected):
+                    pages.require_clean_wrangler_ancestors(cwd)
+                config.unlink()
+            (parent / ".wrangler").mkdir()
+            with self.assertRaises(pages.Rejected):
+                pages.require_clean_wrangler_ancestors(cwd)
+
+    def test_child_environment_drops_every_other_credential_and_runtime_override(self):
+        injected = {"PATH": "/trusted/bin", "GH_TOKEN": "fake-gh-secret", "GITHUB_TOKEN": "other-fake",
+                    "NODE_OPTIONS": "--require=/evil", "BUN_OPTIONS": "--preload=/evil", "PYTHONPATH": "/evil",
+                    "HOME": "/attacker", "HTTPS_PROXY": "https://attacker.invalid", "BWS_ACCESS_TOKEN": "fake-bws",
+                    "GITHUB_ENV": "/commands", "GITHUB_OUTPUT": "/commands", "CLOUDFLARE_API_BASE_URL": "https://attacker.invalid"}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, injected, clear=True):
+            result = pages.wrangler_environment("a" * 32, "fake-cf-canary", Path(tmp))
+            self.assertEqual(result["CLOUDFLARE_API_TOKEN"], "fake-cf-canary")
+            for key in injected.keys() - {"PATH", "HOME"}:
+                self.assertNotIn(key, result)
+            self.assertNotEqual(result["HOME"], "/attacker")
+            self.assertNotIn("fake-gh-secret", json.dumps(result))
+
+    def test_cf_project_identity_and_automatic_build_gate(self):
+        project = {"success": True, "result": {"name": "maple", "subdomain": pages.SUBDOMAIN,
+                   "production_branch": "pages-production", "source": {"config": {"production_deployments_enabled": False}}}}
+        api = MemoryAPI({"/accounts/abc/pages/projects/maple": project})
+        pages.cloudflare_project(api, "abc", "production")
+        project["result"]["source"]["config"]["production_deployments_enabled"] = True
+        with self.assertRaises(pages.Rejected):
+            pages.cloudflare_project(api, "abc", "production")
+        # Preview pilots can coexist until the operator turns off native previews.
+        pages.cloudflare_project(api, "abc", "preview")
+        project["result"]["subdomain"] = "wrong.pages.dev"
+        with self.assertRaises(pages.Rejected):
+            pages.cloudflare_project(api, "abc", "preview")
+
+    def test_artifact_redirect_never_receives_github_authorization(self):
+        requests = []
+
+        class Opener:
+            def open(self, request, timeout):
+                requests.append(request)
+                if len(requests) == 1:
+                    raise HTTPError(request.full_url, 302, "redirect", {"Location": "https://storage.example/artifact?signature=fake"}, None)
+                return io.BytesIO(b"archive")
+
+        api = pages.API("https://api.github.com", "fake-gh-canary")
+        api.opener = Opener()
+        with tempfile.TemporaryDirectory() as tmp:
+            api.download("/repos/owner/repo/actions/artifacts/12/zip", Path(tmp) / "a.zip",
+                         expected_size=7, expected_digest=hashlib.sha256(b"archive").hexdigest(),
+                         accept="application/vnd.github+json")
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer fake-gh-canary")
+        self.assertEqual(requests[0].get_header("Accept"), "application/vnd.github+json")
+        self.assertIsNone(requests[1].get_header("Authorization"))
+
+    def test_release_asset_requests_binary_representation(self):
+        api = pages.API("https://api.github.com", "fake-gh-canary")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(api, "request", return_value=io.BytesIO(b"archive")) as request:
+            api.download("/repos/owner/repo/releases/assets/12", Path(tmp) / "archive")
+        request.assert_called_once_with("/repos/owner/repo/releases/assets/12", accept="application/octet-stream")
+
+    def test_preview_waits_for_deploy_success_not_an_earlier_stage(self):
+        result = {"deployment_id": "a" * 36, "url": "https://12345678.maple-ca8.pages.dev"}
+        plan = {"target": "preview", "sha": SHA, "branch": "pr-12"}
+        deployment = {"environment": "preview", "project_name": "maple", "url": result["url"],
+                      "deployment_trigger": {"metadata": {"commit_hash": SHA, "branch": "pr-12"}}}
+        api = pages.API("https://api.cloudflare.com/client/v4", "fake-cf-canary")
+        stages = [{"name": "build", "status": "success"}, {"name": "deploy", "status": "active"},
+                  {"name": "deploy", "status": "success"}]
+        replies = [{"success": True, "result": {**deployment, "latest_stage": stage}} for stage in stages]
+        with patch.object(api, "json", side_effect=replies) as read, patch.object(pages.time, "sleep") as sleep:
+            pages.verify_deployment(api, "a" * 32, plan, result)
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_non_https_redirect_rejected_without_second_request(self):
+        class Opener:
+            def open(self, request, timeout):
+                raise HTTPError(request.full_url, 302, "redirect", {"Location": "http://attacker.invalid/artifact"}, None)
+
+        api = pages.API("https://api.github.com", "fake-gh-canary")
+        api.opener = Opener()
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(pages.Rejected):
+            api.download("/artifact", Path(tmp) / "a.zip")
+
+    def test_download_bounds_size_and_digest(self):
+        class Opener:
+            def open(self, request, timeout):
+                return io.BytesIO(b"archive")
+
+        for kwargs in ({"limit": 6}, {"expected_size": 8}, {"expected_digest": "0" * 64}):
+            api = pages.API("https://api.github.com", "fake-gh-canary")
+            api.opener = Opener()
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(pages.Rejected):
+                api.download("/artifact", Path(tmp) / "a.zip", **kwargs)
+
+    def test_identifiers_cannot_inject_api_paths_or_output(self):
+        for value in (True, -1, "12\n::error::injected", "1/../../secrets"):
+            with self.assertRaises(pages.Rejected):
+                pages.number(value)
+        for value in (SHA + "\n::error::injected", "../../master", "$(env)"):
+            with self.assertRaises(pages.Rejected):
+                pages.sha(value)
+
+
+if __name__ == "__main__":
+    unittest.main()

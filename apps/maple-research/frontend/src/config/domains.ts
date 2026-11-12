@@ -1,0 +1,19 @@
+const trimTrailingSlash = (value: string) => value.replace(/\/+$/, "");
+
+export const APP_ORIGIN = trimTrailingSlash(
+  import.meta.env.VITE_APP_ORIGIN || "https://app.maple.ai"
+);
+
+export const MARKETING_ORIGIN = trimTrailingSlash(
+  import.meta.env.VITE_MARKETING_ORIGIN || "https://maple.ai"
+);
+
+export function appUrl(path = "/") {
+  return new URL(path, `${APP_ORIGIN}/`).toString();
+}
+
+export function marketingUrl(path = "/") {
+  return new URL(path, `${MARKETING_ORIGIN}/`).toString();
+}
+
+export const MARKETING_DOWNLOADS_URL = marketingUrl("/research#download");

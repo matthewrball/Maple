@@ -1,0 +1,377 @@
+name: Desktop App CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  changes:
+    uses: ./.github/workflows/app-change-detection.yml
+
+  build-macos:
+    environment: desktop-signing
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.frontend != 'false' || needs.changes.outputs.macos != 'false') }}
+    runs-on: blacksmith-6vcpu-macos-26
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # was v4
+        with:
+          persist-credentials: false
+
+      - name: Select pinned Xcode
+        run: python3 scripts/ci/select-xcode.py
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Cache sccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # was v4
+        with:
+          path: ~/Library/Caches/Mozilla.sccache
+          key: ${{ runner.os }}-sccache-macos-release-${{ hashFiles('apps/maple-research/frontend/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-macos-release-
+            ${{ runner.os }}-sccache-macos-
+            ${{ runner.os }}-sccache-
+
+      - name: Build Tauri App (macOS, signed)
+        run: nix develop --no-update-lock-file .#ci -c ./scripts/ci/desktop-release.sh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Show sccache stats
+        if: always()
+        run: nix develop --no-update-lock-file .#ci -c ./scripts/ci/sccache-stats.sh
+
+      - name: Collect macOS release checksums
+        run: |
+          nix develop --no-update-lock-file .#ci -c ./scripts/ci/attestation-manifest.sh \
+            desktop-macos-artifacts.sha256 \
+            apps/maple-research/frontend/src-tauri/target/reproducibility/desktop-release-macos-final.sha256 \
+            apps/maple-research/frontend/src-tauri/target/reproducibility/desktop-release-macos-*.sha256
+          cat desktop-macos-artifacts.sha256
+
+      - name: Attest macOS release artifacts
+        # Keep uploads/verifiers running if GitHub token policy rejects artifact attestation.
+        continue-on-error: true
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # was v4
+        with:
+          subject-checksums: desktop-macos-artifacts.sha256
+
+      - name: Upload macOS Build
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # was v4
+        with:
+          name: maple-macos-universal
+          path: |
+            apps/maple-research/frontend/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            apps/maple-research/frontend/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+            apps/maple-research/frontend/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            apps/maple-research/frontend/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+            apps/maple-research/frontend/src-tauri/target/reproducibility/*.sha256
+          if-no-files-found: warn
+          retention-days: 5
+
+  build-linux:
+    environment: desktop-signing
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.frontend != 'false' || needs.changes.outputs.linux != 'false') }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # was v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Cache sccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # was v4
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-linux-release-${{ hashFiles('apps/maple-research/frontend/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-linux-release-
+            ${{ runner.os }}-sccache-linux-
+            ${{ runner.os }}-sccache-
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces by default; linuxdeploy/AppImage
+      # packaging uses bubblewrap and otherwise fails with "bwrap: setting up uid map: Permission denied".
+      - name: Allow bubblewrap user namespaces
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
+      - name: Build Tauri App (Linux, signed updater)
+        run: nix develop --no-update-lock-file .#desktop-linux -c ./scripts/ci/desktop-release.sh
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Show sccache stats
+        if: always()
+        run: nix develop --no-update-lock-file .#desktop-linux -c ./scripts/ci/sccache-stats.sh
+
+      - name: Collect Linux release checksums
+        run: |
+          nix develop --no-update-lock-file .#desktop-linux -c ./scripts/ci/attestation-manifest.sh \
+            desktop-linux-artifacts.sha256 \
+            apps/maple-research/frontend/src-tauri/target/reproducibility/desktop-release-linux-final.sha256 \
+            apps/maple-research/frontend/src-tauri/target/reproducibility/desktop-release-linux-*.sha256
+          cat desktop-linux-artifacts.sha256
+
+      - name: Attest Linux release artifacts
+        # Keep uploads/verifiers running if GitHub token policy rejects artifact attestation.
+        continue-on-error: true
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # was v4
+        with:
+          subject-checksums: desktop-linux-artifacts.sha256
+
+      - name: Upload Linux Builds
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # was v4
+        with:
+          name: maple-linux
+          path: |
+            apps/maple-research/frontend/src-tauri/target/release/bundle/appimage/*.AppImage
+            apps/maple-research/frontend/src-tauri/target/release/bundle/appimage/*.AppImage.sig
+            apps/maple-research/frontend/src-tauri/target/release/bundle/deb/*.deb
+            apps/maple-research/frontend/src-tauri/target/release/bundle/deb/*.deb.sig
+            apps/maple-research/frontend/src-tauri/target/release/bundle/rpm/*.rpm
+            apps/maple-research/frontend/src-tauri/target/release/bundle/rpm/*.rpm.sig
+            apps/maple-research/frontend/src-tauri/target/reproducibility/*.sha256
+          retention-days: 5
+
+  verify-linux-desktop-artifacts:
+    needs:
+      - build-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # was v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Download Linux desktop artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # was v4
+        with:
+          name: maple-linux
+          path: artifacts
+
+      - name: Verify Linux desktop artifact reproducibility proofs
+        run: nix develop --no-update-lock-file .#desktop-linux -c ./scripts/ci/verify-release-artifacts.sh artifacts linux
+
+  verify-macos-desktop-artifacts:
+    needs:
+      - build-macos
+    runs-on: macos-26
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # was v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Download macOS desktop artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # was v4
+        with:
+          name: maple-macos-universal
+          path: artifacts
+
+      - name: Verify macOS desktop artifact reproducibility proofs
+        run: nix develop --no-update-lock-file .#ci -c ./scripts/ci/verify-release-artifacts.sh artifacts macos
+
+  build-windows:
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.frontend != 'false' || needs.changes.outputs.windows != 'false') }}
+    runs-on: windows-2025
+    timeout-minutes: 150
+    environment: windows-signing
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      MAPLE_WINDOWS_ARTIFACT_SIGNING_ENDPOINT: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+      MAPLE_WINDOWS_ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+      MAPLE_WINDOWS_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # was v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@f4d14e03ff726c06358e5557344e1da148b56cf7 # was v1
+        with:
+          bun-version: 1.3.5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # was stable
+        with:
+          toolchain: 1.94.1
+
+      # Before the long compile, so a failed download fails in about a minute.
+      - name: Install Artifact Signing module
+        shell: pwsh
+        run: ./scripts/ci/install-windows-artifact-signing.ps1
+
+      - name: Build Windows app executable
+        shell: bash
+        run: ./scripts/ci/desktop-windows-release.sh build
+
+      - name: Bundle Windows unsigned installer baseline
+        shell: bash
+        run: ./scripts/ci/desktop-windows-release.sh unsigned-bundle
+
+      - name: Azure login for Artifact Signing
+        uses: azure/login@2dd0bbf4064d5a1812889dc200bb8eed2597f82a # was v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Bundle Windows installer
+        shell: bash
+        run: ./scripts/ci/desktop-windows-release.sh bundle
+
+      - name: Resolve Windows installer paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/ci/_common.sh
+          setup_exe="$(windows_release_setup_exe_required)"
+          echo "MAPLE_WINDOWS_SETUP_EXE_REL=$(repo_relative_path "${setup_exe}")" >> "${GITHUB_ENV}"
+
+      - name: Finalize Windows updater signatures and checksums
+        shell: bash
+        run: ./scripts/ci/desktop-windows-release.sh finalize
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Collect Windows release checksums
+        shell: bash
+        run: |
+          ./scripts/ci/attestation-manifest.sh \
+            desktop-windows-artifacts.sha256 \
+            apps/maple-research/frontend/src-tauri/target/reproducibility/desktop-release-windows-final.sha256 \
+            apps/maple-research/frontend/src-tauri/target/reproducibility/desktop-release-windows-signed-canonical.sha256 \
+            apps/maple-research/frontend/src-tauri/target/reproducibility/desktop-release-windows-runtime-dlls.sha256
+          cat desktop-windows-artifacts.sha256
+
+      - name: Attest Windows release artifacts
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # was v4
+        with:
+          subject-checksums: desktop-windows-artifacts.sha256
+
+      - name: Upload Windows Build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # was v4
+        with:
+          name: maple-windows-x64
+          path: |
+            ${{ env.MAPLE_WINDOWS_SETUP_EXE_REL }}
+            ${{ env.MAPLE_WINDOWS_SETUP_EXE_REL }}.sig
+            apps/maple-research/frontend/src-tauri/target/reproducibility/desktop-release-windows-*.sha256
+          retention-days: 5
+
+  verify-windows-desktop-artifacts:
+    needs:
+      - build-windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # was v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Download Windows desktop artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # was v4
+        with:
+          name: maple-windows-x64
+          path: artifacts
+
+      - name: Verify Windows desktop artifact reproducibility proofs
+        run: nix develop --no-update-lock-file .#ci -c ./scripts/ci/verify-release-artifacts.sh artifacts windows
+
+  verify-desktop-artifacts:
+    needs:
+      - verify-linux-desktop-artifacts
+      - verify-macos-desktop-artifacts
+      - verify-windows-desktop-artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify desktop artifact checks completed
+        run: echo "Desktop artifact verification completed for Linux, macOS, and Windows."

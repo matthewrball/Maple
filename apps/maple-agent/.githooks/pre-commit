@@ -1,0 +1,14 @@
+#!/bin/sh
+# GPUI Agent pre-commit checks. Runs from apps/maple-agent inside its own flake.
+# CI equivalent: the recipes of ci.yml's agent-lint and agent-test lanes.
+# MAPLE_HOOK_FULL=1 adds agent-full-linux's `just ci-extra` (the rest of `just ci`).
+
+set -u
+. "${MAPLE_HOOK_REPO_ROOT:?}/.githooks/lib/common.sh"
+hook_require cargo just python3
+
+hook_run just ci-lint
+hook_run just ci-test
+if [ "${MAPLE_HOOK_FULL:-0}" = "1" ]; then
+    hook_run just ci-extra
+fi

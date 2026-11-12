@@ -1,0 +1,90 @@
+[package]
+name = "maple-agent"
+description = "Transport-neutral Maple agent runtime on the Pi crates: sessions, provider, tools"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+default = ["acp"]
+# The Agent Client Protocol server (`maple_agent::acp`).
+acp = ["dep:agent-client-protocol"]
+# Explicit synthetic-fixture diagnostics; absent from product package builds.
+store-bench = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+once_cell = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+bytes = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dirs = "6"
+httpdate = "1"
+icu_properties = "2.1.1"
+agent-client-protocol = { version = "=2.2.0", optional = true, default-features = false, features = ["unstable_end_turn_token_usage"] }
+rand = "0.8.6"
+rusqlite = { workspace = true }
+libsqlite3-sys = { workspace = true }
+argon2 = { version = "=0.6.0", features = ["parallel", "zeroize"] }
+chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
+zeroize = { workspace = true }
+unicode-normalization = "0.1"
+zxcvbn = "=3.1.1"
+# Keep the existing compatible locked compression release for store payloads.
+zstd = "0.13.3"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+tempfile = "3"
+maple-sdk = { workspace = true }
+maple-proxy = { workspace = true }
+pulldown-cmark = { version = "0.13", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# MCP clients for the account's servers: stdio pipes Maple spawns itself, and streamable HTTP.
+rmcp = { version = "=3.4.1", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
+pi-ai = { path = "../pi-ai", default-features = false }
+pi-agent-core = { path = "../pi-agent-core" }
+pi-coding-agent = { path = "../pi-coding-agent" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+process-wrap = { version = "=9.1.0", default-features = false, features = ["tokio1", "process-session"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# CUA's native SDK is not published to crates.io yet. Pin a trycua/cua
+# main commit (cua-driver 0.38.0 plus the macOS app-bundle health-check and
+# background window enumeration fixes) so Maple's embedded runtime remains
+# reproducible. Keep the ashpd async-io backend (trycua/cua#3687) on Linux.
+cua-driver-sdk = { git = "https://github.com/trycua/cua.git", rev = "2a3975570a885f45ef83f7e81bba54a01804ebd0", package = "cua-driver-sdk" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Ask the session bus whether the GNOME compositor helper is loaded. It is
+# already in the dependency tree through the SDK, so this adds no build cost.
+zbus = { version = "5.19", default-features = false, features = ["blocking-api", "tokio"] }
+# The same pinned revision supplies the Linux backend: AT-SPI over D-Bus for
+# the accessibility tree, the desktop portal for screenshots, and libei for
+# input. `portal-input` is pure Rust plus libxkbcommon, which the Linux build
+# already links, so it stays on by default. PipeWire per-window capture needs
+# libpipewire and libspa headers at build time and is deliberately left off;
+# full-screen portal screenshots do not need it.
+cua-driver-sdk = { git = "https://github.com/trycua/cua.git", rev = "2a3975570a885f45ef83f7e81bba54a01804ebd0", package = "cua-driver-sdk", features = ["portal-input"] }
+
+[dev-dependencies]
+hkdf = "0.12"
+axum = "0.8"
+ciborium = "0.2"
+
+[build-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

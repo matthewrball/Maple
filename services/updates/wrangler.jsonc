@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "maple-updates",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-24",
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+  },
+  "queues": {
+    "producers": [
+      { "binding": "DOWNLOAD_EVENTS", "queue": "maple-download-events" },
+    ],
+  },
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": false,
+    },
+  },
+}

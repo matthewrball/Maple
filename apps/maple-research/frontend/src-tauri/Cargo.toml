@@ -1,0 +1,108 @@
+[package]
+name = "maple"
+version = "3.4.6"
+description = "Maple AI"
+authors = ["tony@trymaple.ai"]
+license = "MIT"
+repository = "https://github.com/MaplePrivacyLabs/Maple"
+edition = "2021"
+rust-version = "1.94.1"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+plist = "1"
+serde_json = "1.0"
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.2", features = [] }
+tauri-plugin-log = "2.8.0"
+# Maple publishes raw Windows installers and Linux AppImages, so it does not
+# need the updater's legacy ZIP / AppImage.tar.gz handlers or their ZIP dependency.
+tauri-plugin-updater = { version = "2.10.1", default-features = false, features = ["rustls-tls"] }
+tauri-plugin = "2.6.2"
+# Keep Android deep links on the last known-working plugin behavior.
+# tauri-plugin-deep-link 2.4.9 added Android-side config filtering that drops
+# our existing cloud.opensecret.maple:// OAuth callback before Rust receives it.
+tauri-plugin-deep-link = "=2.4.7"
+tauri-plugin-single-instance = { version = "=2.4.0", features = ["deep-link"] }
+tauri-plugin-opener = "2.5.4"
+tauri-plugin-os = "2.3.2"
+tauri-plugin-sign-in-with-apple = "1.0.2"
+tokio = { version = "1.0", features = ["fs", "io-util", "net", "sync", "rt-multi-thread", "macros", "time"] }
+once_cell = "1.18.0"
+tauri-plugin-fs = "2.5.1"
+anyhow = "1.0"
+pdf_oxide = { version = "=0.3.74", git = "https://github.com/OpenSecretCloud/pdf_oxide.git", rev = "2bc9246782fe874a97e57e348acc7a9eaa27ca4d", features = ["ocr-ort", "rendering"] }
+# Keep the pre-1.0 Word parser exact-pinned. office_oxide is already in the
+# PDFOxide graph; Maple adds strict DOC/DOCX container and semantic guards.
+office_oxide = { version = "=0.1.15", default-features = false }
+# Maple canonicalizes legacy CFB containers before office_oxide sees them.
+cfb = "=0.10.0"
+quick-xml = "=0.41.0"
+zip = { version = "=9.0.5", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+base64 = "0.22"
+reqwest = { version = "0.13", features = ["stream"] }
+futures-util = "0.3"
+sha2 = "0.10"
+rand = "0.8.6"
+maple-sdk = { path = "../../../../sdk/rust" }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", target_os = "android"))'.dependencies]
+# PDF OCR uses Maple's explicitly packaged ONNX Runtime. The loader policy
+# lives in Maple so iOS can retain static linkage below.
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+maple-proxy = { version = "0.4.0", path = "../../../../proxy" }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Let AppKit persist the frame in its native point coordinate space. This
+# avoids physical-pixel scaling errors on Retina and mixed-DPI displays.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+tauri-plugin-iap = { path = "plugins/tauri-plugin-iap" }
+# We build ONNX Runtime 1.23.2 from source for iOS (see scripts/build-ios-onnxruntime.sh)
+# We disable download-binaries and copy-dylibs since we link our own xcframework
+# PDF OCR needs "std" for Error trait impl and file operations, and "ndarray"
+# for tensor creation.
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["std", "ndarray"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+openssl = { version = "0.10.80", default-features = false, features = ["vendored"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-roots = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Store the proxy API key in Windows Credential Manager rather than as
+# plaintext in the roaming %APPDATA% config (which can sync across machines).
+keyring = { version = "3", features = ["windows-native"] }
+
+[patch.crates-io]
+# The embedded proxy requires `maple-sdk` from the registry; resolve it to the same
+# in-tree source as the dependency above (docs/sdk-publishing.md).
+maple-sdk = { path = "../../../../sdk/rust" }
+# Local patch for tao 0.35.2 Android intent crashes:
+# https://github.com/tauri-apps/tao/issues/1217
+#
+# Tao's Android intent handler currently unwraps several JNI calls that can
+# receive null objects from real Android launch/deep-link flows, aborting the
+# process before tauri-plugin-deep-link sees OAuth/payment redirects. Remove
+# this once Tauri resolves to a Tao release containing the upstream fix.
+# The vendored library uses this application's Cargo.lock; its upstream
+# standalone lockfile is intentionally omitted.
+tao = { path = "patches/tao-0.35.2" }

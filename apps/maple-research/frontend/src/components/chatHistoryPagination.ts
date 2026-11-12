@@ -1,0 +1,176 @@
+export const CHAT_HISTORY_TOP_MARGIN_PX = 100;
+
+export type ChatHistoryScrollSnapshot = {
+  scrollTop: number;
+  scrollHeight: number;
+  anchorId?: string;
+  anchorOffset?: number;
+};
+
+export function normalizedChatHistoryScrollSnapshot(
+  snapshot: ChatHistoryScrollSnapshot
+): ChatHistoryScrollSnapshot {
+  const elasticTopOffset = Math.min(0, snapshot.scrollTop);
+
+  return {
+    ...snapshot,
+    scrollTop: Math.max(0, snapshot.scrollTop),
+    ...(snapshot.anchorOffset === undefined
+      ? {}
+      : { anchorOffset: snapshot.anchorOffset + elasticTopOffset })
+  };
+}
+
+export function preferredChatHistoryScrollSnapshot({
+  requestStartSnapshot,
+  commitSnapshot
+}: {
+  requestStartSnapshot: ChatHistoryScrollSnapshot | null;
+  commitSnapshot: ChatHistoryScrollSnapshot | null;
+}): ChatHistoryScrollSnapshot | null {
+  const commitHasVisibleAnchor = Boolean(
+    commitSnapshot && commitSnapshot.anchorId && commitSnapshot.anchorOffset !== undefined
+  );
+  const preferredSnapshot = commitHasVisibleAnchor
+    ? commitSnapshot
+    : (requestStartSnapshot ?? commitSnapshot);
+
+  return preferredSnapshot ? normalizedChatHistoryScrollSnapshot(preferredSnapshot) : null;
+}
+
+export function restoredChatHistoryScrollTop(
+  snapshot: ChatHistoryScrollSnapshot,
+  nextScrollHeight: number
+): number {
+  return Math.max(0, snapshot.scrollTop + nextScrollHeight - snapshot.scrollHeight);
+}
+
+export function restoredChatHistoryAnchorScrollTop(
+  currentScrollTop: number,
+  previousAnchorOffset: number,
+  nextAnchorOffset: number
+): number {
+  return Math.max(0, currentScrollTop + nextAnchorOffset - previousAnchorOffset);
+}
+
+export function requiredChatHistoryBottomCompensation(
+  restoredScrollTop: number,
+  scrollHeight: number,
+  clientHeight: number
+): number {
+  const maxScrollTop = Math.max(0, scrollHeight - clientHeight);
+  return Math.max(0, restoredScrollTop - maxScrollTop);
+}
+
+export function chatHistoryCursorProgressed(
+  currentOldestItemId: string,
+  nextOldestItemId: string | undefined
+): boolean {
+  return Boolean(nextOldestItemId && nextOldestItemId !== currentOldestItemId);
+}
+
+export function usesFirstCancelableWheelGestureStart({
+  isTauriEnvironment,
+  browserPlatform
+}: {
+  isTauriEnvironment: boolean;
+  browserPlatform: string;
+}): boolean {
+  // `WheelEvent.cancelable` marks Chrome's first event reliably enough for the
+  // rapid follow-up gesture workaround, but WKWebView can make later events
+  // cancelable again while momentum or an anchor restoration is settling.
+  return !isTauriEnvironment && browserPlatform.startsWith("Mac");
+}
+
+export class ChatHistoryPaginationGate {
+  private intentArmed = false;
+  private gestureActive = false;
+  private loadInFlight = false;
+  private queuedLoad = false;
+
+  beginGesture(): void {
+    if (this.gestureActive) return;
+
+    this.gestureActive = true;
+    this.intentArmed = true;
+  }
+
+  beginWheelGesture(isNewGesture: boolean): void {
+    if (!isNewGesture) return;
+
+    // Chrome makes the first wheel event in a hardware gesture cancelable and
+    // later direct/momentum events non-cancelable when that first event is not
+    // prevented. A new first event is therefore stronger evidence than an
+    // arbitrary quiet-period timer and may replace a still active,
+    // already-consumed gesture.
+    this.gestureActive = true;
+    this.intentArmed = true;
+  }
+
+  endGesture(): void {
+    this.gestureActive = false;
+    this.intentArmed = false;
+  }
+
+  resetIntent(): void {
+    this.gestureActive = false;
+    this.intentArmed = false;
+    this.queuedLoad = false;
+  }
+
+  tryStartLoad({
+    canLoad,
+    topBoundaryVisible,
+    requestInFlight = false
+  }: {
+    canLoad: boolean;
+    topBoundaryVisible: boolean;
+    requestInFlight?: boolean;
+  }): boolean {
+    if (!canLoad || !topBoundaryVisible || !this.intentArmed) {
+      return false;
+    }
+
+    this.intentArmed = false;
+
+    if (this.loadInFlight) {
+      // The new gesture already reached the boundary, so preserve exactly one
+      // later page even if that gesture ends before the active prepend settles.
+      this.queuedLoad = true;
+      return false;
+    }
+
+    // A runtime can be projected again while a request owned by its previous
+    // projection is still pending. Do not issue the same cursor twice from the
+    // new gate, and do not turn that discarded intent into a post-failure retry.
+    if (requestInFlight) return false;
+
+    this.loadInFlight = true;
+    return true;
+  }
+
+  finishLoad({ preserveQueuedLoad = false }: { preserveQueuedLoad?: boolean } = {}): void {
+    this.loadInFlight = false;
+    if (!preserveQueuedLoad) {
+      this.queuedLoad = false;
+    }
+    // Only a gesture that actually reached the boundary is represented by the
+    // queue. Never let merely armed intent survive a request and become an
+    // observer-driven follow-up after the prepend changes layout.
+    this.intentArmed = false;
+  }
+
+  tryStartQueuedLoad({ canLoad }: { canLoad: boolean }): boolean {
+    if (!this.queuedLoad) return false;
+    if (this.loadInFlight) return false;
+
+    this.queuedLoad = false;
+    if (!canLoad) {
+      this.intentArmed = false;
+      return false;
+    }
+
+    this.loadInFlight = true;
+    return true;
+  }
+}

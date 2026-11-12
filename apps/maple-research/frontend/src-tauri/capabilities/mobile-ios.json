@@ -1,0 +1,46 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "mobile-ios",
+  "description": "Capabilities for iOS",
+  "windows": [
+    "main"
+  ],
+  "platforms": ["iOS"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "updater:default",
+    "deep-link:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "mailto:*"
+        },
+        {
+          "url": "http://localhost:5173/*"
+        },
+        {
+          "url": "https://trymaple.ai/*"
+        },
+        {
+          "url": "https://*.stripe.com/*"
+        },
+        {
+          "url": "https://*.stripe.network/*"
+        },
+        {
+          "url": "https://*.zaprite.com/*"
+        },
+        {
+          "url": "https://opensecret.cloud/*"
+        },
+        {
+          "url": "https://*"
+        }
+      ]
+    },
+    "sign-in-with-apple:default",
+    "iap:default"
+  ]
+}

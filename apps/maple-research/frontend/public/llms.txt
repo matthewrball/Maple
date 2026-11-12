@@ -1,0 +1,14 @@
+> Canonical Maple marketing and product documentation now lives at https://www.trymaple.ai/llms.txt.
+
+# Maple App Host
+
+`https://trymaple.ai` is currently the Maple Research app and authentication entry point.
+
+- App entry: https://trymaple.ai/
+- Sign up: https://trymaple.ai/signup
+- Log in: https://trymaple.ai/login
+- Marketing home: https://www.trymaple.ai/
+- Full marketing documentation: https://www.trymaple.ai/llms-full.txt
+
+This short app-host file exists for compatibility while Maple is splitting marketing and app
+surfaces across domains.

@@ -1,0 +1,23 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["X773Y823TN.cloud.opensecret.maple"],
+        "components": [
+          {
+            "/": "/payment-success*",
+            "comment": "Matches URLs for successful payments"
+          },
+          {
+            "/": "/payment-canceled*",
+            "comment": "Matches URLs for canceled payments"
+          },
+          {
+            "/": "/pricing*",
+            "comment": "Matches URLs for pricing page with parameters"
+          }
+        ]
+      }
+    ]
+  }
+}

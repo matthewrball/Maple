@@ -1,0 +1,39 @@
+{
+  "dev": {
+    "display_name": "Maple Work Dev",
+    "bundle_id": "cloud.opensecret.maple.agent.dev",
+    "data_namespace": "maple-agent-dev",
+    "api_url": "https://enclave.secretgpt.ai",
+    "billing_api_url": "https://billing-dev.opensecret.cloud",
+    "web_url": "https://app-dev.maple.ai",
+    "auth_origin": "https://auth-dev.maple.ai",
+    "client_id": "ba5a14b5-d915-47b1-b7b1-afda52bc5fc6",
+    "pcr_environment": "development",
+    "update_tag_prefix": "maple-agent-dev-v",
+    "update_feed_url": null,
+    "linux_update_feed_url": null,
+    "windows_update_feed_url": null,
+    "update_public_keys": [],
+    "prerelease": true
+  },
+  "prod": {
+    "display_name": "Maple Work",
+    "bundle_id": "cloud.opensecret.maple.agent",
+    "data_namespace": "maple-agent-prod",
+    "api_url": "https://enclave.trymaple.ai",
+    "billing_api_url": "https://billing.opensecret.cloud",
+    "web_url": "https://app.maple.ai",
+    "auth_origin": "https://auth.maple.ai",
+    "client_id": "ba5a14b5-d915-47b1-b7b1-afda52bc5fc6",
+    "pcr_environment": "production",
+    "update_tag_prefix": "maple-agent-v",
+    "update_feed_url": "https://updates.maple.ai/agent/stable/latest.json",
+    "linux_update_feed_url": "https://updates.maple.ai/agent/stable/linux/latest.json",
+    "windows_update_feed_url": "https://updates.maple.ai/agent/stable/windows/latest.json",
+    "update_public_keys": [
+      "RWSEawHGDqhs8hlPvW08LCDXexMVkxqCtKhorNHTVpgMmYlls07md+mc",
+      "RWR3nhVL8nlVmwQBTSKl/dl6a0V3eseG260Be3/aYVb4+K8MgBfyOyN4"
+    ],
+    "prerelease": false
+  }
+}

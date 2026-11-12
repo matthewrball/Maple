@@ -1,0 +1,11 @@
+User-agent: *
+Allow: /
+
+Disallow: /api/
+Disallow: /desktop-auth
+Disallow: /auth/
+Disallow: /payment-success
+Disallow: /payment-canceled
+
+# Marketing discovery artifacts live on the canonical Phase 1 marketing host.
+Sitemap: https://www.trymaple.ai/sitemap.xml

@@ -1,0 +1,28 @@
+FROM docker.io/library/python:3.13.16-slim-bookworm@sha256:5024f48ba9441d4b13a95d3945abc6365538e3a31109833367a1923523c6efed
+
+# The pinned base predates Bookworm's CVE-2026-103111 (libpcre2),
+# CVE-2026-13221 et al. (perl-base) and CVE-2026-84782 (libssl3) fixes.
+# Keep the digest stable while requiring the fixed packages from
+# bookworm-security.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade \
+        libpcre2-8-0=10.42-1+deb12u2 \
+        perl-base=5.36.0-7+deb12u4 \
+        libssl3=3.0.22-1~deb12u2 \
+    && test "$(dpkg-query -W -f='${Version}' libpcre2-8-0)" = '10.42-1+deb12u2' \
+    && test "$(dpkg-query -W -f='${Version}' perl-base)" = '5.36.0-7+deb12u4' \
+    && test "$(dpkg-query -W -f='${Version}' libssl3)" = '3.0.22-1~deb12u2' \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes -r requirements.txt \
+    && python -m pip check \
+    && python -m pip uninstall -y pip \
+    && rm -r /usr/local/lib/python3.13/ensurepip
+
+COPY credential_requester.py .
+
+ENV PORT 8003
+CMD python credential_requester.py --port $PORT

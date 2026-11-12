@@ -1,0 +1,21 @@
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_MAPLE_DESKTOP_VARIANT?: "dev";
+  readonly VITE_MAPLE_APP_VARIANT?: "production" | "dev";
+  readonly VITE_MAPLE_DEV_AUTH_ORIGIN?: string;
+  readonly VITE_STOREKIT_EXPERIMENT?: string;
+  readonly VITE_OPEN_SECRET_API_URL: string;
+  readonly VITE_OPEN_SECRET_PCR_ENVIRONMENT?: "production" | "development";
+  readonly VITE_OS_FLAGS_BASE_URL?: string;
+  readonly VITE_FORCE_FEATURE_FLAGS?: string;
+  readonly VITE_CLIENT_ID?: string;
+  readonly VITE_MAPLE_BILLING_API_URL?: string;
+  readonly VITE_DEV_MODEL_OVERRIDE?: string;
+  readonly VITE_APP_ORIGIN?: string;
+  readonly VITE_MARKETING_ORIGIN?: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}

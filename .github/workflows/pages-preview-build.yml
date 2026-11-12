@@ -1,0 +1,106 @@
+name: Pages preview build
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/web-build.yml"
+      - ".github/workflows/pages-*.yml"
+      - "apps/maple-research/frontend/**"
+      - "!apps/maple-research/frontend/src-tauri/**"
+      - "scripts/prepare-frontend-deps.sh"
+      - "scripts/prepare-typescript-sdk.sh"
+      - "scripts/ci/_common.sh"
+      - "scripts/ci/web.sh"
+      - "scripts/ci/pages_*.py"
+      - "scripts/ci/test_pages_*.py"
+      - "flake.nix"
+      - "flake.lock"
+  pull_request:
+    branches: [master]
+    paths:
+      - ".github/workflows/web-build.yml"
+      - ".github/workflows/pages-*.yml"
+      - "apps/maple-research/frontend/**"
+      - "!apps/maple-research/frontend/src-tauri/**"
+      - "scripts/prepare-frontend-deps.sh"
+      - "scripts/prepare-typescript-sdk.sh"
+      - "scripts/ci/_common.sh"
+      - "scripts/ci/web.sh"
+      - "scripts/ci/pages_*.py"
+      - "scripts/ci/test_pages_*.py"
+      - "flake.nix"
+      - "flake.lock"
+
+concurrency:
+  # A newer PR head replaces an older preview build; master builds never cancel.
+  group: pages-preview-build-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-preview:
+    # Untrusted PR code runs here without deployment credentials or write permissions.
+    # Fork PRs retain their existing CI checks, but do not get a hosted Pages preview.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout preview source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+
+      - name: Checkout workflow tooling
+        # Older PR heads may not contain the deployment tooling yet. This is the
+        # unprivileged workflow/merge SHA; the publisher still distrusts its output.
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          path: .pages-tools
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Build with development services
+        run: nix develop --no-update-lock-file .#ci -c ./scripts/ci/web.sh
+        env:
+          MAPLE_WEB_ENVIRONMENT: pr
+          MAPLE_IOS_DEV_AUTH_ORIGIN: ${{ vars.MAPLE_IOS_DEV_AUTH_ORIGIN }}
+
+      - name: Describe the preview artifact
+        run: |
+          artifact_dir=apps/maple-research/frontend/src-tauri/target/reproducibility
+          nix develop --no-update-lock-file "$GITHUB_WORKSPACE/.pages-tools#pages" \
+            -c python3 -I "$GITHUB_WORKSPACE/.pages-tools/scripts/ci/pages_artifact.py" manifest \
+            --archive "$artifact_dir/maple-web-dist.tar.gz" \
+            --profile pr \
+            --sha "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$artifact_dir/pages-artifact.json"
+
+      - name: Upload the preview artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: maple-pages-preview-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            apps/maple-research/frontend/src-tauri/target/reproducibility/maple-web-dist.tar.gz
+            apps/maple-research/frontend/src-tauri/target/reproducibility/pages-artifact.json
+          if-no-files-found: error
+          retention-days: 5

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Maple"
+  short_description: "Prepare Maple releases and authorized store handoffs"
+  default_prompt: "Use $release-maple to prepare or verify the explicitly requested Maple release or store handoff."

@@ -1,0 +1,191 @@
+# Task runner for Maple Agent. Run `just` to list the recipes.
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+export CARGO_TERM_COLOR := "always"
+
+# Share Cargo intermediate artifacts across Agent worktrees. Final
+# binaries stay in this checkout's target/. Skip in CI, when disabled, or
+# when CARGO_BUILD_BUILD_DIR is already set. rustc host+version keep
+# incompatible toolchains in separate caches.
+export CARGO_BUILD_BUILD_DIR := `if [ -n "${CARGO_BUILD_BUILD_DIR:-}" ]; then printf "%s" "$CARGO_BUILD_BUILD_DIR"; elif [ -n "${CI:-}" ] || [ "${MAPLE_DISABLE_SHARED_CARGO_BUILD_DIR:-0}" = "1" ]; then printf target; elif command -v rustc >/dev/null 2>&1; then printf "%s/.cache/cargo-build/maple-agent/%s/rust-%s" "$HOME" "$(rustc -vV | awk '/^host:/{print $2}')" "$(rustc --version | awk '{print $2}')"; else printf target; fi`
+
+headless := "--no-default-features --features acp,proxy"
+
+# List the recipes.
+default:
+    @just --list --unsorted
+
+# Full synthetic final-schema measurements (2k tasks / 1M entries), both modes.
+# Arguments such as `seed --tasks ...` select the explicit stopped-profile tool.
+store-bench *ARGS:
+    cargo run --release --locked -p store-bench -- {{if ARGS == "" { "--full" } else { ARGS }}}
+
+# Small actual-Durable workload; unknown runner baselines remain explicitly pending.
+store-bench-ci:
+    cargo run --release --locked -p store-bench -- --ci --output target/store-bench-ci.json
+    python3 crates/store-bench/scripts/evaluate.py target/store-bench-ci.json --profile linux-ci
+    python3 -m unittest discover -s crates/store-bench/tests -p 'test_*.py'
+
+# Run the checks of CI's Linux Agent lanes (agent-lint, agent-test, agent-full-linux).
+ci: ci-lint ci-test ci-extra
+
+# The ci.yml agent-lint lane: format, packaging tests, clippy for every feature set and the dependency graph.
+ci-lint: fmt-check git-metadata-test packaging-test
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo clippy -p maple-agent-app --all-targets --locked {{headless}} -- -D warnings
+    cargo clippy -p maple-agent-app --locked --no-default-features --features acp -- -D warnings
+    cargo clippy -p maple-agent-app --locked --no-default-features --features proxy -- -D warnings
+    metadata="$(mktemp)"; trap 'rm -f "$metadata"' EXIT; \
+      cargo metadata --locked --format-version 1 > "$metadata"; \
+      python3 ../../scripts/ci/verify-agent-rust-deps.py "$metadata"; \
+      python3 scripts/verify-sqlcipher-build.py "$metadata"
+
+# The ci.yml agent-test lane; `cargo test` builds the examples, ci-lint's clippy checks the benches.
+ci-test:
+    RUSTFLAGS="-D warnings" cargo test --workspace --locked
+
+# The ci.yml agent-full-linux lane: every target built, and the headless tests.
+ci-extra:
+    RUSTFLAGS="-D warnings" cargo build --workspace --all-targets --locked
+    RUSTFLAGS="-D warnings" cargo test -p maple-agent-app --locked {{headless}}
+
+# The ci.yml agent-supply-chain lane: SQLCipher sources, per-target advisories and bans.
+supply-chain:
+    python3 -m unittest discover -s dependencies/sqlcipher -p 'test_*.py'
+    metadata="$(mktemp)"; trap 'rm -f "$metadata"' EXIT; \
+      cargo metadata --locked --format-version 1 > "$metadata"; \
+      python3 dependencies/sqlcipher/verify_sources.py --metadata "$metadata"; \
+      python3 dependencies/sqlcipher/verify_sqlcipher.py --metadata "$metadata"
+    python3 scripts/audit-sqlcipher-dependencies.py
+
+# The ci.yml agent-package-linux/macos lanes: an unsigned Dev package, built and verified like master's.
+package-rehearsal:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./scripts/build-release.sh dev
+    if [ "$(uname -s)" = Darwin ]; then
+        ./scripts/verify-prebuilt-release.sh dev
+        ./scripts/package-release.sh dev --unsigned
+        ./scripts/verify-release.sh dev dist/dev --unsigned
+    else
+        ./scripts/package-release.sh dev --unsigned
+        ./scripts/verify-release.sh dev dist/dev --unsigned --platform linux-x86_64
+        cargo build --locked -p maple-agent-updater --example validate-release-archive
+        ./scripts/verify-updater-archive.sh dist/dev --profile dev --platform linux-x86_64 --unsigned
+        ./scripts/verify-linux-bundle-docker.sh dev dist/dev
+    fi
+
+# Exercise the production Git metadata helper without compiling the app graph.
+git-metadata-test:
+    python3 scripts/test_git_metadata.py
+
+# Format all code.
+fmt:
+    cargo fmt --all
+
+# Check that all code is formatted.
+fmt-check:
+    cargo fmt --all -- --check
+
+# Run clippy for the workspace and for each feature set that CI checks.
+clippy:
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo clippy -p maple-agent-app --all-targets --locked {{headless}} -- -D warnings
+    cargo clippy -p maple-agent-app --locked --no-default-features --features acp -- -D warnings
+    cargo clippy -p maple-agent-app --locked --no-default-features --features proxy -- -D warnings
+
+# Build and run the tests for the workspace and for the headless build.
+test:
+    RUSTFLAGS="-D warnings" cargo build --workspace --all-targets --locked
+    RUSTFLAGS="-D warnings" cargo test --workspace --locked
+    RUSTFLAGS="-D warnings" cargo test -p maple-agent-app --locked {{headless}}
+
+# Record what Neovim does for each composer Vim case, using the Neovim this
+# flake pins. Run after adding a case to the file.
+vim-cases:
+    nix shell --inputs-from . nixpkgs#neovim -c nvim --clean --headless -l scripts/record-vim-cases.lua app/src/ui/text_input/vim_neovim_cases.json
+
+# Build the debug binary.
+build:
+    cargo build -p maple-agent-app
+
+# Stage the debug binary in a stable macOS app bundle. A stable bundle identity
+# is required for honest Accessibility and Screen Recording permission tests.
+debug-app: build
+    ./scripts/macos-debug-app.sh
+
+# Build the release binary.
+release:
+    cargo build --release -p maple-agent-app --locked
+
+# Build an immutable Dev or Prod profile without any signing credentials.
+build-release PROFILE:
+    ./scripts/build-release.sh {{PROFILE}}
+
+# Restore downloaded execution permissions and check the exact profile/source.
+verify-prebuilt-release PROFILE:
+    ./scripts/verify-prebuilt-release.sh {{PROFILE}}
+
+# Package the already built profile; --unsigned is for unprivileged PR checks.
+package-release PROFILE *ARGS:
+    ./scripts/package-release.sh {{PROFILE}} {{ARGS}}
+
+# Verify exact downloaded artifacts and their recorded public identity.
+verify-release PROFILE DIRECTORY *ARGS:
+    ./scripts/verify-release.sh {{PROFILE}} {{DIRECTORY}} {{ARGS}}
+
+# Hermetic public metadata and mocked native signing boundary regressions.
+packaging-test:
+    python3 ./scripts/test_release_packaging.py
+    python3 ./scripts/test_linux_release_appimage.py
+    python3 ./scripts/test_linux_release_bundle.py
+    python3 ./scripts/test_linux_install.py
+    python3 ./scripts/test_macos_release_dylibs.py
+    python3 ./scripts/test_macos_build_info.py
+    python3 ./scripts/test_windows_build_info.py
+    python3 ./scripts/test_windows_host_spawn.py
+    python3 ./scripts/test_windows_release.py
+    python3 ./scripts/test_smoke_macos_release.py
+    python3 ./scripts/test_smoke_linux_bundle_host.py
+
+# Build a release binary that keeps symbols for backtraces.
+release-debug:
+    CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+        cargo build --release -p maple-agent-app --locked
+
+# Build the headless binary (acp and proxy modes, no window).
+headless:
+    cargo build --release -p maple-agent-app --locked {{headless}}
+
+# Build and run the debug binary with debug logs for the app.
+run *ARGS: build
+    ./target/debug/maple-agent host stop
+    RUST_LOG=warn,maple_agent=debug ./target/debug/maple-agent {{ARGS}}
+
+# Build the release binary and copy it to dist/ with a version, commit, and SHA-256.
+dist: release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+    rev=$(git rev-parse --short HEAD)
+    dirty=""
+    if [ -n "$(git status --porcelain)" ]; then dirty="-dirty"; fi
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64) target=linux-x86_64 ;;
+        Darwin-arm64) target=macos-aarch64 ;;
+        Darwin-x86_64) target=macos-x86_64 ;;
+        *) target="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)" ;;
+    esac
+    name="maple-agent-${version}-${rev}${dirty}-${target}"
+    mkdir -p dist
+    cp target/release/maple-agent "dist/${name}"
+    (cd dist && shasum -a 256 "${name}" | tee "${name}.sha256")
+
+# Remove this checkout's target/ without wiping the shared Cargo cache.
+clean-local:
+    CARGO_BUILD_BUILD_DIR=target cargo clean
+
+# Remove this checkout's target/ and dist/. Keeps the shared Cargo cache.
+clean: clean-local
+    rm -rf dist

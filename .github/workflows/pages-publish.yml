@@ -1,0 +1,145 @@
+name: Publish Pages
+
+on:
+  workflow_run:
+    workflows: ["Pages preview build", "Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Production web build run ID (leave both inputs blank for latest stable release)"
+        type: string
+        required: false
+        default: ""
+      build_run_attempt:
+        description: "Exact production web build attempt (required with build_run_id)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    name: Publish development preview
+    if: >-
+      vars.MAPLE_PAGES_PREVIEW_ENABLED == 'true' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.path == '.github/workflows/pages-preview-build.yml' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'pull_request' ||
+        (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'master'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: pages-preview-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    environment:
+      name: pages-preview
+      # The publisher reports the artifact SHA, not this job's master checkout SHA.
+      deployment: false
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      deployments: write
+    steps:
+      # workflow_run uses the default branch SHA. Never checkout or execute the
+      # triggering PR's scripts, dependencies, workflow, or deployment config here.
+      - name: Checkout trusted publisher
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Install trusted deployment dependencies
+        working-directory: services/updates
+        run: nix develop --no-update-lock-file ../..#pages -c bun install --frozen-lockfile --ignore-scripts
+
+      - name: Verify and prepare the preview artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          nix develop --no-update-lock-file .#pages -c python3 -I scripts/ci/pages_deploy.py
+          prepare --target preview --state "$RUNNER_TEMP/maple-pages"
+
+      - name: Deploy the verified preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: >-
+          nix develop --no-update-lock-file .#pages -c python3 -I scripts/ci/pages_deploy.py
+          deploy --state "$RUNNER_TEMP/maple-pages"
+
+  production:
+    name: Publish verified production web artifact
+    if: >-
+      vars.MAPLE_PAGES_PRODUCTION_ENABLED == 'true' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
+        (github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'release' &&
+          startsWith(github.event.workflow_run.head_branch, 'v') &&
+          github.event.workflow_run.path == '.github/workflows/release.yml' &&
+          github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      # Serialize manual and release-triggered production publication.
+      group: pages-production
+      cancel-in-progress: false
+    environment:
+      name: pages-production
+      # Keep job completion from superseding the verified artifact deployment.
+      deployment: false
+    permissions:
+      contents: write
+      actions: read
+      deployments: write
+    steps:
+      - name: Checkout trusted publisher
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Install trusted deployment dependencies
+        working-directory: services/updates
+        run: nix develop --no-update-lock-file ../..#pages -c bun install --frozen-lockfile --ignore-scripts
+
+      - name: Verify and prepare the production artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          nix develop --no-update-lock-file .#pages -c python3 -I scripts/ci/pages_deploy.py
+          prepare --target production --state "$RUNNER_TEMP/maple-pages"
+
+      - name: Deploy the verified production artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: >-
+          nix develop --no-update-lock-file .#pages -c python3 -I scripts/ci/pages_deploy.py
+          deploy --state "$RUNNER_TEMP/maple-pages"

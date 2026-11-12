@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        var stored = localStorage.getItem("maple-theme");
+        var isDark =
+          stored === "dark" ||
+          (stored !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+
+        if (isDark) {
+          document.documentElement.classList.add("dark");
+          document.documentElement.style.colorScheme = "dark";
+        } else {
+          document.documentElement.style.colorScheme = "light";
+        }
+      })();
+    </script>
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+    />
+    <title>Maple Research | Private AI Workspace</title>
+    <!-- Research stays out of search indexing; marketing owns public SEO. -->
+    <meta
+      name="description"
+      content="Open Maple Research to sign up or log in to your private AI workspace."
+    />
+    <meta name="robots" content="noindex, follow" />
+    <meta name="application-name" content="Maple AI" />
+    <meta
+      name="keywords"
+      content="Maple Research, private AI workspace, encrypted AI chat, confidential computing"
+    />
+    <meta name="theme-color" content="#e2e2e2" />
+    <meta name="creator" content="Maple AI" />
+    <meta name="category" content="Tools" />
+    <meta name="classification" content="Web Application" />
+    <!-- Open Graph -->
+    <meta property="og:title" content="Maple Research | Private AI Workspace" />
+    <meta
+      property="og:description"
+      content="Open Maple Research to sign up or log in to your private AI workspace."
+    />
+    <meta property="og:image" content="https://app.maple.ai/assets/research-social-card-v1.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta
+      property="og:image:alt"
+      content="Maple Research — Research life’s harder questions, with a private AI workspace."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://app.maple.ai/" />
+    <meta property="og:site_name" content="Maple AI" />
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@TryMapleAI" />
+    <meta name="twitter:title" content="Maple Research | Private AI Workspace" />
+    <meta
+      name="twitter:description"
+      content="Open Maple Research to sign up or log in to your private AI workspace."
+    />
+    <meta name="twitter:image" content="https://app.maple.ai/assets/research-social-card-v1.jpg" />
+    <meta
+      name="twitter:image:alt"
+      content="Maple Research — Research life’s harder questions, with a private AI workspace."
+    />
+    <!-- Icons -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/android-chrome-192x192.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="preload" href="/maple-logo.svg" as="image" type="image/svg+xml" />
+    <link
+      rel="preload"
+      href="/fonts/Manrope-VariableFont_wght.ttf"
+      as="font"
+      type="font/ttf"
+      crossorigin
+    />
+  </head>
+  <body>
+    <div id="root" class="h-full"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

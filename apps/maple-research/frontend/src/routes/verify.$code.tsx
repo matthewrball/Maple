@@ -1,0 +1,96 @@
+import { createFileRoute, useNavigate, useRouter } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
+import { useOpenSecret } from "@mapleai/sdk";
+import { AlertDestructive } from "@/components/AlertDestructive";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Loader2 } from "lucide-react";
+import { navigateToSafeInternalRedirect } from "@/utils/internalRedirect";
+
+export const Route = createFileRoute("/verify/$code")({
+  component: VerifyEmail
+});
+
+function VerifyEmail() {
+  const { code } = Route.useParams();
+  const [isVerifying, setIsVerifying] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const navigate = useNavigate();
+  const router = useRouter();
+  const { verifyEmail, refetchUser } = useOpenSecret();
+
+  useEffect(() => {
+    let cancelled = false;
+    let redirectTimer: ReturnType<typeof setTimeout> | undefined;
+
+    async function verify() {
+      try {
+        await verifyEmail(code);
+        if (cancelled) return;
+
+        // Do both refetch and navigation after a delay
+        redirectTimer = setTimeout(async () => {
+          await refetchUser();
+          if (cancelled) return;
+
+          // Check for a pending redirect (e.g. team invite page)
+          const pendingRedirect = sessionStorage.getItem("post_auth_redirect");
+          sessionStorage.removeItem("post_auth_redirect");
+          if (!navigateToSafeInternalRedirect(router.history, pendingRedirect)) {
+            navigate({ to: "/" });
+          }
+        }, 2000);
+      } catch (err) {
+        if (cancelled) return;
+        if (err instanceof Error) {
+          setError(err.message);
+        } else {
+          setError("An unknown error occurred");
+        }
+      } finally {
+        if (!cancelled) setIsVerifying(false);
+      }
+    }
+
+    void verify();
+
+    return () => {
+      cancelled = true;
+      if (redirectTimer !== undefined) clearTimeout(redirectTimer);
+    };
+  }, [code, navigate, verifyEmail, refetchUser, router]);
+
+  if (isVerifying) {
+    return (
+      <Card className="max-w-md mx-auto mt-20">
+        <CardHeader>
+          <CardTitle>Verifying Email</CardTitle>
+        </CardHeader>
+        <CardContent className="flex justify-center">
+          <Loader2 className="h-8 w-8 animate-spin" />
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (error) {
+    return (
+      <Card className="max-w-md mx-auto mt-20">
+        <CardHeader>
+          <CardTitle>Verification Failed</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <AlertDestructive title="Error" description={error} />
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="max-w-md mx-auto mt-20">
+      <CardHeader>
+        <CardTitle>Email Verified</CardTitle>
+      </CardHeader>
+      <CardContent>Your email has been successfully verified. Redirecting...</CardContent>
+    </Card>
+  );
+}

@@ -1,0 +1,10 @@
+# These recipes dispatch GitHub Actions; they never publish from this machine.
+set positional-arguments
+
+# Validate the committed npm version in Actions; pass trusted false to publish.
+publish-npm version mode="trusted" dry_run="true":
+    gh workflow run sdk-publish-npm.yml --repo MaplePrivacyLabs/Maple --ref master --raw-field "version=$1" --raw-field "mode=$2" --raw-field "dry_run=$3"
+
+# Validate the committed Rust version in Actions; pass trusted false to publish.
+publish-cargo version mode="trusted" dry_run="true":
+    gh workflow run sdk-publish-rust.yml --repo MaplePrivacyLabs/Maple --ref master --raw-field "version=$1" --raw-field "mode=$2" --raw-field "dry_run=$3"

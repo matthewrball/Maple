@@ -1,0 +1,42 @@
+name: Frontend Tests
+
+# Release evidence for every master push that changes the Research frontend
+# (.agents/skills/release-maple/scripts/ci_evidence.py). Pull requests run the
+# same script in ci.yml's research-web lane. Never cancelled.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - ".github/workflows/frontend-tests.yml"
+      - "apps/maple-research/frontend/**"
+      - "!apps/maple-research/frontend/src-tauri/**"
+      - "scripts/prepare-frontend-deps.sh"
+      - "scripts/prepare-typescript-sdk.sh"
+      - "scripts/ci/_common.sh"
+      - "scripts/ci/frontend.sh"
+      - "flake.nix"
+      - "flake.lock"
+
+jobs:
+  test-frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # was v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@96c5ee93a9dddf2830d31e1da6ec719077336c28 # v3.23.3
+        with:
+          source-tag: v3.23.3
+          github-token: ""
+
+      - name: Verify pinned Nix runtime
+        run: bash scripts/ci/verify-nix-runtime.sh
+
+      - name: Run frontend checks
+        run: nix develop --no-update-lock-file .#ci -c ./scripts/ci/frontend.sh

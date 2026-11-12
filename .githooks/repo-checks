@@ -1,0 +1,29 @@
+#!/bin/sh
+# Repository-level pre-commit checks: workflow lint and the CI script tests.
+# Runs from the repository root inside the root flake's ci shell whenever the
+# staged paths select the ci.yml repo lane. That lane runs every root flake
+# check (`just lane repo`); the release gates and toolchain checks stay there.
+
+set -u
+. "${MAPLE_HOOK_REPO_ROOT:?}/.githooks/lib/common.sh"
+
+workflows=$(hook_staged_matching '^\.github/workflows/.*\.ya?ml$')
+if [ -n "$workflows" ]; then
+    hook_require actionlint
+    for workflow in $workflows; do
+        if [ "$workflow" = ".github/workflows/pages-publish.yml" ] ||
+           [ "$workflow" = ".github/workflows/auth-pages-publish.yml" ] ||
+           [ "$workflow" = ".github/workflows/auth-pages-dev-publish.yml" ]; then
+            hook_run actionlint -config-file .github/actionlint.yaml \
+                -ignore 'unexpected key "deployment" for "environment" section' "$workflow"
+        else
+            hook_run actionlint -config-file .github/actionlint.yaml \
+                -ignore 'unexpected key "queue" for "concurrency" section' "$workflow"
+        fi
+    done
+fi
+
+hook_require python3
+hook_run python3 -I -m unittest discover -s scripts/ci -p 'test_*.py'
+
+hook_log "Reminder: run 'just lane repo' (nix flake check) before pushing flake, workflow, or release changes."
